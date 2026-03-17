@@ -444,7 +444,7 @@ def default_repo_analysis(repo_root: Path) -> RepoAnalysisProposal:
 def _analysis_prompt(repo_root: Path, selection: InitSetupSelection) -> str:
     context_files = _likely_context_files(repo_root)
     sections = [
-        "You are configuring BOA Researcher for an existing repository.",
+        "You are configuring BOA Research for an existing repository.",
         "Analyze the repository and return exactly one JSON object that matches the provided schema.",
         "Do not wrap the JSON in markdown fences.",
         f"Repository root: {repo_root}",

@@ -16,11 +16,11 @@ class InitBannerTests(unittest.TestCase):
 
     def test_banner_collapses_when_narrow(self) -> None:
         banner = render_banner(width=40, height=24, allow_unicode=True)
-        self.assertEqual(banner, "BOA Researcher | boa init")
+        self.assertEqual(banner, "BOA Research | boa init")
 
     def test_ascii_banner_snapshot(self) -> None:
         banner = render_banner(width=100, height=24, allow_unicode=False)
-        self.assertIn("BOA RESEARCHER", banner)
+        self.assertIn("BOA RESEARCH", banner)
         self.assertIn("code patch -> descriptor -> trial -> promotion", banner)
 
 

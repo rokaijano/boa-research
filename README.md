@@ -1,4 +1,4 @@
-# BOA Researcher
+# BOA Research
 
 `boaresearch` packages BOA (Bayesian Optimized Agents) as a reusable controller for third-party Git repositories.
 

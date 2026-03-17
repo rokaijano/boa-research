@@ -10,7 +10,7 @@ from .loader import load_config
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="BOA Researcher")
+    parser = argparse.ArgumentParser(description="BOA Research")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subparsers.add_parser("init", help="Initialize a repository for BOA")
