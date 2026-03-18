@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from .git_auth import GitAuthManager
-from .metrics import extract_metrics
+from .metrics import MetricExtractionError, extract_metrics
 from .schema import LocalRunnerConfig, MetricConfig, RunnerStageConfig, SSHRunnerConfig, StageCommandResult
 
 
@@ -158,7 +158,12 @@ class LocalTrialRunner(BaseTrialRunner):
                 target_path = captured_root / metric.path
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_path, target_path)
-        extracted_metrics = extract_metrics(artifact_dir=stage_artifact_dir, metrics=metrics) if status == "succeeded" else {}
+        extracted_metrics: dict[str, float] = {}
+        if status == "succeeded":
+            try:
+                extracted_metrics = extract_metrics(artifact_dir=stage_artifact_dir, metrics=metrics)
+            except MetricExtractionError:
+                status = "metric_missing"
         return StageExecution(
             stage_name=stage_name,
             branch_name=branch_name,
@@ -417,7 +422,12 @@ class SSHTrialRunner(BaseTrialRunner):
                         max_rss_kb=max_rss_kb,
                     )
                 )
-        extracted_metrics = extract_metrics(artifact_dir=stage_artifact_dir, metrics=metrics)
+        try:
+            extracted_metrics = extract_metrics(artifact_dir=stage_artifact_dir, metrics=metrics)
+            status = stage_env.get("status", "failed")
+        except MetricExtractionError:
+            extracted_metrics = {}
+            status = "metric_missing"
         resource_metadata = {
             "hostname": stage_env.get("hostname"),
             "remote_pid": stage_env.get("remote_pid"),
@@ -426,7 +436,7 @@ class SSHTrialRunner(BaseTrialRunner):
         return StageExecution(
             stage_name=stage_name,
             branch_name=branch_name,
-            status=stage_env.get("status", "failed"),
+            status=status,
             command_results=command_results,
             metrics=extracted_metrics,
             resource_metadata=resource_metadata,

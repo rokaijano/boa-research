@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from boaresearch.schema import CandidateMetadata, PatchDescriptor, StageRunResult, StageCommandResult
-from boaresearch.store import ExperimentStore
+from boaresearch.schema import CandidateMetadata, CandidatePlan, PatchDescriptor, SearchToolCall, StageCommandResult, StageRunResult
+from boaresearch.runtime import ExperimentStore
 
 
 class StoreTests(unittest.TestCase):
@@ -19,6 +19,16 @@ class StoreTests(unittest.TestCase):
             patch_category="optimizer",
             operation_type="replace",
             estimated_risk=0.2,
+            informed_by_call_ids=["boa-call-1"],
+        )
+        candidate_plan = CandidatePlan(
+            hypothesis="h",
+            rationale_summary="plan",
+            selected_parent_branch="boa/demo/accepted",
+            patch_category="optimizer",
+            operation_type="replace",
+            estimated_risk=0.2,
+            informed_by_call_ids=["boa-call-1"],
         )
         descriptor = PatchDescriptor(
             touched_files=["src/train.py"],
@@ -33,15 +43,26 @@ class StoreTests(unittest.TestCase):
             budget_used="scout",
             diff_path="/tmp/patch.diff",
         )
+        trace = [
+            SearchToolCall(
+                call_id="boa-call-1",
+                tool_name="suggest_parents",
+                phase="planning",
+                request={"limit": 3},
+                response={"suggestions": []},
+                created_at="2024-01-01T00:00:00+00:00",
+            )
+        ]
         store.create_trial(
             run_tag="demo",
             trial_id="demo-0001",
             branch_name="boa/demo/trial/demo-0001",
             parent_branch="boa/demo/accepted",
             parent_trial_id=None,
+            candidate_plan=candidate_plan,
             candidate=candidate,
             descriptor=descriptor,
-            search_decision={"policy": "random"},
+            search_trace=trace,
             diff_path=Path("/tmp/patch.diff"),
         )
         stage_result = StageRunResult(
@@ -92,6 +113,9 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(recent), 1)
         self.assertEqual(recent[0].trial_id, "demo-0001")
         self.assertEqual(recent[0].canonical_stage, "scout")
+        self.assertIsNotNone(recent[0].candidate_plan)
+        self.assertEqual(recent[0].candidate_plan.selected_parent_branch, "boa/demo/accepted")
+        self.assertEqual(recent[0].search_trace[0].call_id, "boa-call-1")
         self.assertIsNotNone(incumbent)
         self.assertEqual(incumbent.trial_id, "demo-0001")
 

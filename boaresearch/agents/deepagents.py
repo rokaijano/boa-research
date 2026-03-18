@@ -6,10 +6,16 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-from ..prompt_builder import build_agent_system_prompt, build_agent_task
-from ..schema import CandidateMetadata
+from ..prompt_builder import (
+    build_execution_system_prompt,
+    build_execution_task,
+    build_planning_system_prompt,
+    build_planning_task,
+)
+from ..schema import AgentExecutionContext, AgentPlanningContext, CandidateMetadata, CandidatePlan
+from ..search import SearchOracleService, SearchToolbox, SearchTraceRecorder, read_search_tool_context
 from .base import BaseResearchAgent, ResearchAgentError
-from .tools import AgentToolHarness, CandidateSubmissionRecorder, build_agent_tools
+from .tools import AgentToolHarness, CandidatePlanSubmissionRecorder, CandidateSubmissionRecorder, build_agent_tools
 
 
 def _import_attr(module_names: list[str], attr: str) -> Any:
@@ -42,13 +48,13 @@ class DeepAgentsResearchAgent(BaseResearchAgent):
         *,
         repo_root: Path,
         agent_config,
+        config,
         run_preflight,
-        read_recent_trials,
     ) -> None:
         self.repo_root = repo_root
         self.agent_config = agent_config
+        self.config = config
         self._run_preflight = run_preflight
-        self._read_recent_trials = read_recent_trials
 
     def _build_model(self):
         init_chat_model = _import_attr(
@@ -123,28 +129,73 @@ class DeepAgentsResearchAgent(BaseResearchAgent):
             return agent(payload)
         raise ResearchAgentError("DeepAgents runtime returned a non-invokable agent object")
 
-    def prepare_candidate(self, context) -> CandidateMetadata:
-        recorder = CandidateSubmissionRecorder()
-        harness = AgentToolHarness(
-            run_preflight=self._run_preflight,
-            read_recent_trials=self._read_recent_trials,
-            submission=recorder,
-        )
-        tools = build_agent_tools(harness)
-        memories_path = self.repo_root / ".boa" / "runtime" / "deepagents" / context.run_tag / "memories"
+    def _search_tools(self, *, recent_trials, accepted_branch: str, tool_context_path: Path) -> SearchToolbox:
+        tool_context = read_search_tool_context(tool_context_path)
+        oracle = SearchOracleService(config=self.config, memory=recent_trials, accepted_branch=accepted_branch)
+        recorder = SearchTraceRecorder(trace_path=tool_context.trace_path, phase=tool_context.phase)
+        return SearchToolbox(oracle=oracle, recorder=recorder)
+
+    def _memories_path(self, run_tag: str) -> Path:
+        return self.repo_root / ".boa" / "runtime" / "deepagents" / run_tag / "memories"
+
+    def _invoke_phase(self, *, worktree_path: Path, run_tag: str, tools: list[object], system_prompt: str, task: str, max_agent_steps: int) -> None:
+        memories_path = self._memories_path(run_tag)
         memories_path.mkdir(parents=True, exist_ok=True)
         model = self._build_model()
-        backend = self._build_backend(worktree_path=context.worktree_path, memories_path=memories_path)
-        system_prompt = build_agent_system_prompt(repo_root=self.repo_root, context=context)
-        task = build_agent_task(context)
+        backend = self._build_backend(worktree_path=worktree_path, memories_path=memories_path)
         agent = self._create_agent(
             model=model,
             backend=backend,
             tools=tools,
             system_prompt=system_prompt,
-            max_agent_steps=context.max_agent_steps,
+            max_agent_steps=max_agent_steps,
         )
         self._invoke_agent(agent, task)
+
+    def plan_trial(self, context: AgentPlanningContext) -> CandidatePlan:
+        recorder = CandidatePlanSubmissionRecorder()
+        harness = AgentToolHarness(
+            run_preflight=self._run_preflight,
+            search_tools=self._search_tools(
+                recent_trials=context.recent_trials,
+                accepted_branch=context.accepted_branch,
+                tool_context_path=context.tool_context_path,
+            ),
+            plan_submission=recorder,
+        )
+        tools = build_agent_tools(harness, phase="planning")
+        self._invoke_phase(
+            worktree_path=context.worktree_path,
+            run_tag=context.run_tag,
+            tools=tools,
+            system_prompt=build_planning_system_prompt(repo_root=self.repo_root, context=context),
+            task=build_planning_task(context),
+            max_agent_steps=context.max_agent_steps,
+        )
+        if recorder.plan is None:
+            raise ResearchAgentError("DeepAgents must call submit_candidate_plan() before returning control")
+        return recorder.plan
+
+    def prepare_candidate(self, context: AgentExecutionContext) -> CandidateMetadata:
+        recorder = CandidateSubmissionRecorder()
+        harness = AgentToolHarness(
+            run_preflight=self._run_preflight,
+            search_tools=self._search_tools(
+                recent_trials=context.recent_trials,
+                accepted_branch=context.accepted_branch,
+                tool_context_path=context.tool_context_path,
+            ),
+            candidate_submission=recorder,
+        )
+        tools = build_agent_tools(harness, phase="execution")
+        self._invoke_phase(
+            worktree_path=context.worktree_path,
+            run_tag=context.run_tag,
+            tools=tools,
+            system_prompt=build_execution_system_prompt(repo_root=self.repo_root, context=context),
+            task=build_execution_task(context),
+            max_agent_steps=context.max_agent_steps,
+        )
         if recorder.candidate is None:
             raise ResearchAgentError("DeepAgents must call submit_candidate() before returning control")
         return recorder.candidate

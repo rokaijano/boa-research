@@ -32,3 +32,6 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["boaresearch*"]
+
+[tool.setuptools.package-data]
+boaresearch = ["prompts/**/*.md"]

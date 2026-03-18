@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import io
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from boaresearch.cli import build_parser
+from boaresearch.cli import build_parser, main
 
 
 class CliTests(unittest.TestCase):
@@ -27,6 +29,22 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.command, "run")
         self.assertEqual(args.repo, Path("/tmp/repo"))
         self.assertEqual(args.config, Path("/tmp/repo/boa.config"))
+
+    def test_tools_accept_subcommand_and_optional_paths(self) -> None:
+        args = build_parser().parse_args(["tools", "recent-trials", "/tmp/repo", "--config", "/tmp/repo/boa.config"])
+        self.assertEqual(args.command, "tools")
+        self.assertEqual(args.tool_command, "recent-trials")
+        self.assertEqual(args.repo, Path("/tmp/repo"))
+        self.assertEqual(args.config, Path("/tmp/repo/boa.config"))
+
+    def test_init_interrupt_prints_goodbye_message(self) -> None:
+        stderr = io.StringIO()
+        with patch("boaresearch.cli.parse_args", return_value=build_parser().parse_args(["init"])):
+            with patch("boaresearch.cli.InitWizard") as wizard_cls:
+                wizard_cls.return_value.run.side_effect = KeyboardInterrupt()
+                with patch("sys.stderr", stderr):
+                    main()
+        self.assertIn("BOA init cancelled. Goodbye.", stderr.getvalue())
 
 
 if __name__ == "__main__":

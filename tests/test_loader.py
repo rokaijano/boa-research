@@ -26,7 +26,7 @@ class LoaderTests(unittest.TestCase):
         (temp_dir / "boa.config").write_text(
             textwrap.dedent(
                 f"""
-                schema_version = 2
+                schema_version = 3
 
                 [run]
                 tag = "demo"
@@ -69,7 +69,7 @@ class LoaderTests(unittest.TestCase):
                 direction = "maximize"
 
                 [search]
-                policy = "local_ranking"
+                oracle = "bayesian_optimization"
                 seed = 7
                 """
             ).strip()
@@ -81,12 +81,12 @@ class LoaderTests(unittest.TestCase):
     def test_load_config_from_repo_root_local(self) -> None:
         repo = self._make_repo(mode="local")
         config = load_config(repo)
-        self.assertEqual(config.schema_version, 2)
+        self.assertEqual(config.schema_version, 3)
         self.assertEqual(config.agent.runtime, "cli")
         self.assertEqual(config.runner.mode, "local")
         self.assertEqual(config.run.accepted_branch, "boa/demo/accepted")
         self.assertEqual(config.guardrails.allowed_paths, ["src"])
-        self.assertEqual(config.search.policy, "local_ranking")
+        self.assertEqual(config.search.oracle, "bayesian_optimization")
         self.assertTrue(str(config.run.worktree_path).endswith("/.boa/worktrees/demo"))
 
     def test_load_config_from_repo_root_ssh(self) -> None:
@@ -104,6 +104,18 @@ class LoaderTests(unittest.TestCase):
     def test_old_config_is_rejected(self) -> None:
         repo = self._make_repo()
         (repo / "boa.config").write_text("[run]\ntag = \"demo\"\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            load_config(repo)
+
+    def test_policy_field_is_rejected_in_v3(self) -> None:
+        repo = self._make_repo()
+        (repo / "boa.config").write_text(
+            (repo / "boa.config").read_text(encoding="utf-8").replace(
+                'oracle = "bayesian_optimization"',
+                'policy = "bayesian_optimization"',
+            ),
+            encoding="utf-8",
+        )
         with self.assertRaises(ValueError):
             load_config(repo)
 

@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from boaresearch.init_app import InitWizard, PromptAdapter
-from boaresearch.init_models import (
+from boaresearch.init import InitWizard, PromptAdapter
+from boaresearch.init.models import (
     DetectedRepo,
     ExistingSetupReport,
     InitSetupSelection,
@@ -15,7 +15,7 @@ from boaresearch.init_models import (
     ValidationReport,
     WriteResult,
 )
-from boaresearch.init_services import InitServices
+from boaresearch.init import InitServices
 
 
 class FakePrompts:
@@ -98,6 +98,7 @@ class InitAppTests(unittest.TestCase):
                 False,
                 "default",
                 "default",
+                "light",
                 "local",
                 "",
                 False,
@@ -114,6 +115,7 @@ class InitAppTests(unittest.TestCase):
         draft = wizard.run()
         self.assertIsNotNone(draft.write_result)
         self.assertIsNotNone(draft.validation)
+        self.assertEqual(draft.selection.agent_aggressiveness, "light")
         self.assertTrue(any("No BOA files detected" in line for line in output))
 
     def test_review_mode_stops_before_writing(self) -> None:

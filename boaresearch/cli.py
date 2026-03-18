@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 
-from .controller import BoaController
-from .init_app import InitWizard
+from .init import InitWizard
 from .loader import load_config
+from .runtime import BoaController
+from .runtime.tools import TOOL_COMMANDS, run_tools_command
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,6 +26,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path to boa.config. Defaults to <repo>/boa.config",
     )
+
+    tools_parser = subparsers.add_parser("tools", help="Invoke BOA search tools")
+    tools_parser.add_argument("tool_command", choices=sorted(TOOL_COMMANDS.keys()))
+    tools_parser.add_argument("repo", nargs="?", default=None, type=Path, help="Optional path inside the target Git repository")
+    tools_parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Optional path to boa.config. Defaults to <repo>/boa.config or BOA_CONFIG_PATH",
+    )
+    tools_parser.add_argument(
+        "--context",
+        type=Path,
+        default=None,
+        help="Optional path to a BOA tool context JSON file.",
+    )
     return parser
 
 
@@ -35,11 +53,17 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
     args = parse_args()
     if args.command == "init":
-        InitWizard(initial_path=Path(args.repo)).run()
+        try:
+            InitWizard(initial_path=Path(args.repo)).run()
+        except (KeyboardInterrupt, EOFError):
+            print("\nBOA init cancelled. Goodbye.", file=sys.stderr)
         return
     if args.command == "run":
         config = load_config(repo=args.repo, config_path=args.config)
         BoaController(config).run()
+        return
+    if args.command == "tools":
+        run_tools_command(args)
         return
     raise ValueError(f"Unsupported command: {args.command}")
 

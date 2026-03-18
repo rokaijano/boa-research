@@ -8,7 +8,6 @@ def build_agent(
     *,
     repo_root,
     run_preflight,
-    read_recent_trials,
 ) -> BaseResearchAgent:
     runtime = str(config.agent.runtime).strip().lower()
     if runtime == "deepagents":
@@ -17,8 +16,8 @@ def build_agent(
         return DeepAgentsResearchAgent(
             repo_root=repo_root,
             agent_config=config.agent,
+            config=config,
             run_preflight=run_preflight,
-            read_recent_trials=read_recent_trials,
         )
     if runtime == "cli":
         from .cli import CliResearchAgent

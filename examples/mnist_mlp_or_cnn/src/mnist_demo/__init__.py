@@ -1,0 +1,1 @@
+"""MNIST BOA demo package."""

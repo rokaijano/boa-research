@@ -130,6 +130,9 @@ def _build_config(raw: dict[str, Any], repo_root: Path, config_path: Path, boa_m
             f"boa.config is not a current BOA config: expected schema_version = {CONFIG_SCHEMA_VERSION}, found {schema_version}"
         )
     agent_raw = resolve_agent_profile(dict(raw.get("agent", {}) or {}))
+    search_raw = dict(raw.get("search", {}) or {})
+    if "policy" in search_raw:
+        raise ValueError("search.policy is not supported in schema_version = 3; use search.oracle")
     cfg = BoaConfig(
         schema_version=schema_version,
         run=RunConfig(**dict(raw.get("run", {}) or {})),
@@ -139,7 +142,7 @@ def _build_config(raw: dict[str, Any], repo_root: Path, config_path: Path, boa_m
         runner=_build_runner_config(dict(raw.get("runner", {}) or {})),
         metrics=_build_metric_configs(raw.get("metrics")),
         objective=ObjectiveConfig(**dict(raw.get("objective", {}) or {})),
-        search=SearchConfig(**dict(raw.get("search", {}) or {})),
+        search=SearchConfig(**search_raw),
         repo_root=repo_root,
         config_path=config_path,
         boa_md_path=boa_md_path,
@@ -285,12 +288,22 @@ def validate_config(cfg: BoaConfig) -> BoaConfig:
     if cfg.objective.minimum_improvement_delta < 0.0:
         raise ValueError("objective.minimum_improvement_delta must be >= 0")
 
-    policy = str(cfg.search.policy).strip().lower()
-    if policy not in {"random", "greedy_best_first", "local_ranking"}:
-        raise ValueError("search.policy must be one of: random, greedy_best_first, local_ranking")
-    cfg.search.policy = policy
+    oracle = str(cfg.search.oracle).strip().lower()
+    if oracle != "bayesian_optimization":
+        raise ValueError("search.oracle must be bayesian_optimization")
+    cfg.search.oracle = oracle
     if cfg.search.max_history < 1:
         raise ValueError("search.max_history must be >= 1")
+    if cfg.search.parent_suggestion_count < 1:
+        raise ValueError("search.parent_suggestion_count must be >= 1")
+    if cfg.search.family_suggestion_count < 1:
+        raise ValueError("search.family_suggestion_count must be >= 1")
+    if cfg.search.knob_region_count < 1:
+        raise ValueError("search.knob_region_count must be >= 1")
+    if cfg.search.exploration_weight < 0.0:
+        raise ValueError("search.exploration_weight must be >= 0")
+    if cfg.search.observation_noise <= 0.0:
+        raise ValueError("search.observation_noise must be > 0")
 
     if not cfg.boa_md_path.exists():
         raise FileNotFoundError(f"Target repo is missing boa.md: {cfg.boa_md_path}")

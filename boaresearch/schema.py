@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 3
 StageName = Literal["scout", "confirm", "promoted"]
 MetricSource = Literal["json_file", "regex", "metric_file"]
 ObjectiveDirection = Literal["maximize", "minimize"]
@@ -138,12 +138,17 @@ class ObjectiveConfig:
 
 @dataclass
 class SearchConfig:
-    policy: str = "random"
+    oracle: str = "bayesian_optimization"
     seed: Optional[int] = None
     max_history: int = 50
+    parent_suggestion_count: int = 5
+    family_suggestion_count: int = 5
+    knob_region_count: int = 5
     risk_penalty: float = 0.25
     family_bonus: float = 0.1
     lineage_bonus: float = 0.05
+    exploration_weight: float = 0.35
+    observation_noise: float = 0.15
 
 
 @dataclass
@@ -163,13 +168,30 @@ class BoaConfig:
 
 
 @dataclass
-class SearchDecision:
-    policy: str
-    parent_branch: str
+class DescriptorDraft:
+    patch_category: str
+    operation_type: str
+    estimated_risk: float
+    target_symbols: list[str] = field(default_factory=list)
+    numeric_knobs: dict[str, float] = field(default_factory=dict)
+    touched_files: list[str] = field(default_factory=list)
+    parent_branch: Optional[str] = None
     parent_trial_id: Optional[str] = None
-    patch_category_hint: Optional[str] = None
-    prompt_hints: list[str] = field(default_factory=list)
-    budget_hint: Optional[str] = None
+
+
+@dataclass
+class CandidatePlan:
+    hypothesis: str
+    rationale_summary: str
+    selected_parent_branch: str
+    selected_parent_trial_id: Optional[str] = None
+    patch_category: str = ""
+    operation_type: str = ""
+    estimated_risk: float = 0.0
+    target_symbols: list[str] = field(default_factory=list)
+    numeric_knobs: dict[str, float] = field(default_factory=dict)
+    notes: Optional[str] = None
+    informed_by_call_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -182,6 +204,7 @@ class CandidateMetadata:
     target_symbols: list[str] = field(default_factory=list)
     numeric_knobs: dict[str, float] = field(default_factory=dict)
     notes: Optional[str] = None
+    informed_by_call_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -200,16 +223,29 @@ class PatchDescriptor:
 
 
 @dataclass
+class SearchToolCall:
+    call_id: str
+    tool_name: str
+    phase: str
+    request: dict[str, Any]
+    response: dict[str, Any]
+    created_at: str
+
+
+@dataclass
 class TrialSummary:
     trial_id: str
+    run_tag: str
     branch_name: str
     parent_branch: str
     parent_trial_id: Optional[str]
     acceptance_status: str
     canonical_stage: Optional[str]
     canonical_score: Optional[float]
+    candidate_plan: Optional[CandidatePlan]
     candidate: Optional[CandidateMetadata]
     descriptor: Optional[PatchDescriptor]
+    search_trace: list[SearchToolCall] = field(default_factory=list)
     stage_scores: dict[str, float] = field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""
@@ -272,20 +308,44 @@ class StageEvaluation:
 
 
 @dataclass
-class AgentContext:
+class AgentPlanningContext:
+    repo_root: Path
+    worktree_path: Path
+    trial_id: str
+    run_tag: str
+    accepted_branch: str
+    boa_md_path: Path
+    extra_context_files: list[Path]
+    allowed_paths: list[str]
+    protected_paths: list[str]
+    recent_trials: list[TrialSummary]
+    objective_summary: str
+    max_agent_steps: int
+    prompt_bundle_dir: Path
+    tool_context_path: Path
+    plan_output_path: Path
+
+
+@dataclass
+class AgentExecutionContext:
     repo_root: Path
     worktree_path: Path
     trial_id: str
     run_tag: str
     accepted_branch: str
     trial_branch: str
+    parent_branch: str
+    parent_trial_id: Optional[str]
     boa_md_path: Path
     extra_context_files: list[Path]
     allowed_paths: list[str]
     protected_paths: list[str]
-    search_decision: SearchDecision
     recent_trials: list[TrialSummary]
     objective_summary: str
     preflight_commands: list[str]
     max_agent_steps: int
     prompt_bundle_dir: Path
+    tool_context_path: Path
+    plan_output_path: Path
+    candidate_output_path: Path
+    candidate_plan: CandidatePlan

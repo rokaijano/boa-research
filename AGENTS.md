@@ -4,9 +4,10 @@ This repository packages BOA (Bayesian Optimized Agents) as a reusable Python to
 
 ## Core Model
 
-- BOA is the controller, onboarding flow, search layer, acceptance engine, experiment store, and trial runner.
-- Patch-authoring endpoints such as Codex, Claude Code, Copilot, or DeepAgents do not decide acceptance, promotion, or final lineage.
-- The BO layer is decision support. It chooses parent lineage and search hints, but it does not author diffs directly.
+- BOA is the controller, onboarding flow, BO oracle layer, acceptance engine, experiment store, and trial runner.
+- Patch-authoring endpoints such as Codex, Claude Code, Copilot, or DeepAgents do not decide acceptance or promotion.
+- The coding agent is the search strategist. It may choose hypotheses and select a parent lineage from BOA-provided lineage options.
+- The BO layer is decision support. It provides acquisition-style guidance, lineage ranking, family ranking, and numeric knob suggestions, but it does not author diffs directly.
 - Target repositories are the runtime boundary. `boa init` converts an existing Git repository into a BOA-ready repository.
 - BOA persists runtime state inside the target repo under `.boa/`.
 - BOA is the source of truth for:
@@ -26,10 +27,18 @@ This repository packages BOA (Bayesian Optimized Agents) as a reusable Python to
   - `boa init /path/to/repo`
 - `boa init` launches an interactive `InquirerPy` setup wizard by default.
 - `boa.md` is required in the target repo root and is injected verbatim into the patch-authoring prompt for `boa run`.
-- `boa.config` is required in the target repo root, parsed as TOML, and must use `schema_version = 2`.
+- `boa init` also captures the desired coding aggressiveness for `boa.md`: `light`, `normal`, or `aggressive`.
+- `boa.config` is required in the target repo root, parsed as TOML, and must use `schema_version = 3`.
 - The execution CLI is:
   - `boa run`
   - `boa run /path/to/target/repo`
+- The BO oracle CLI is:
+  - `boa tools recent-trials`
+  - `boa tools list-lineage-options`
+  - `boa tools suggest-parents`
+  - `boa tools score-candidate-descriptor`
+  - `boa tools rank-patch-families`
+  - `boa tools propose-numeric-knob-regions`
 - Managed branches are:
   - accepted branch: `boa/<run_tag>/accepted`
   - trial branch: `boa/<run_tag>/trial/<trial_id>`
@@ -62,7 +71,7 @@ If this layout changes materially, update this file in the same change.
 - `boaresearch/runner.py`: local and SSH stage runners
 - `boaresearch/store.py`: SQLite experiment memory
 - `boaresearch/acceptance.py`: staged scout/confirm/promoted acceptance logic
-- `boaresearch/search.py`: pluggable search policies
+- `boaresearch/search.py`: Bayesian oracle service, lineage ranking, and search tool tracing
 - `boaresearch/descriptors.py`: diff-to-`PatchDescriptor` extraction
 - `boaresearch/metrics.py`: JSON/regex/metric-file extraction
 - `boaresearch/agents/`: endpoint adapters for CLI tools and DeepAgents
@@ -77,17 +86,36 @@ If this layout changes materially, update this file in the same change.
 - The wizard must not mutate final config state ad hoc from widget values.
 - Repo analysis is separate from patch authoring. It returns a structured proposal that BOA merges with wizard selections before writing files.
 - File generation for `boa.config` and `boa.md` must be deterministic. Agent analysis may suggest content, but BOA writers own the final rendering.
+- The selected coding aggressiveness is wizard-owned state and must be rendered into `boa.md` as BOA-authored guidance for patch size and rewrite scope.
 - Existing BOA files are handled as:
   - valid current setup: `review`, `overwrite`, or `update`
   - invalid or foreign setup: raw preview plus `overwrite`
 
 ## Endpoint Contract
 
-- Endpoints run locally inside the BOA-managed trial worktree.
-- Endpoints may inspect the worktree and edit only allowed files.
-- Endpoints must not make acceptance, promotion, persistence, or branch-policy decisions.
-- Endpoints must emit exactly one candidate metadata JSON object at the BOA-designated path for the current trial.
-- BOA computes the actual diff, touched files, descriptor, branch lineage, and evaluation outcomes.
+- Endpoints run in two phases:
+  - planning on the accepted-branch workspace
+  - execution inside the BOA-managed trial worktree
+- Endpoints may inspect the workspace and edit only allowed files during execution.
+- Endpoints must not make acceptance, promotion, persistence, or arbitrary branch-policy decisions.
+- Endpoints may choose a parent lineage only from BOA-provided lineage options.
+- Endpoints must emit exactly one candidate plan JSON object and exactly one candidate metadata JSON object at the BOA-designated paths for the current trial.
+- Endpoints may call BOA tools multiple times during planning and execution.
+- BOA computes the actual diff, touched files, descriptor, validated branch lineage, and evaluation outcomes.
+
+Candidate plan fields are:
+
+- `hypothesis`
+- `rationale_summary`
+- `selected_parent_branch`
+- optional `selected_parent_trial_id`
+- `patch_category`
+- `operation_type`
+- `estimated_risk`
+- optional `target_symbols`
+- optional `numeric_knobs`
+- optional `notes`
+- `informed_by_call_ids`
 
 Candidate metadata fields are:
 
@@ -99,17 +127,22 @@ Candidate metadata fields are:
 - optional `target_symbols`
 - optional `numeric_knobs`
 - optional `notes`
+- `informed_by_call_ids`
 
-If candidate metadata is missing, malformed, or inconsistent with the produced diff, BOA treats the trial as failed.
+If the candidate plan or candidate metadata is missing, malformed, cites unknown BO tool call ids, selects an invalid parent branch, or is inconsistent with the produced diff, BOA treats the trial as failed or policy-rejected.
 
 ## Trial Semantics
 
 A trial is valid only if all of the following hold:
 
+- the planning phase completed without fatal adapter error
+- the candidate plan was emitted and parsed successfully
+- the selected parent branch is a BOA-known lineage option
 - the endpoint completed without fatal adapter error
 - the worktree contains a non-empty diff
 - the diff touches only allowed files
 - candidate metadata was emitted and parsed successfully
+- the cited BO tool call ids resolve to the current trial trace
 - the configured stage command executed
 - metric extraction succeeded for the stage being evaluated
 
@@ -145,18 +178,23 @@ The following trial outcomes should remain distinct in persistence and reporting
   - a minimum improvement delta
 - Lower stages qualify advancement. The highest enabled successfully completed stage is the canonical evaluation stage for that trial.
 - Endpoint self-reports never determine acceptance.
-- Search policies currently include:
-  - `random`
-  - `greedy_best_first`
-  - `local_ranking`
-
-`local_ranking` is a BOA policy over BOA-maintained descriptors and outcomes. It is not delegated to endpoint adapters.
+- Search is agent-led and BO-assisted.
+- The only supported BO oracle in the current schema is `bayesian_optimization`.
+- BOA exposes search primitives rather than a top-level policy gate:
+  - recent trial summaries
+  - lineage option listing
+  - parent suggestions
+  - candidate descriptor scoring
+  - patch family ranking
+  - numeric knob region proposals
+- BOA validates any lineage chosen by the agent before the trial branch is created.
 
 ## Config Discipline
 
 - `boa.config` is parsed as typed TOML, not ad hoc dictionaries.
-- `schema_version = 2` is required.
+- `schema_version = 3` is required.
 - Use the current `agent` and `runner` sections. Do not reintroduce deprecated `endpoint` or `remote` top-level config shapes.
+- Use the current `search.oracle` contract. Do not reintroduce `search.policy`.
 - Prefer extending typed config and schema surfaces rather than adding hidden conventions.
 
 ## Working Rules For Agents
@@ -180,7 +218,8 @@ Minimum useful smoke path when relevant:
 - write `boa.config` and `boa.md`
 - load `boa.config`
 - create a trial
-- emit candidate metadata
+- emit candidate plan and candidate metadata
+- call at least one BO tool
 - compute a diff
 - run one stage
 - parse one metric

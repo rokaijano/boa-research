@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from boaresearch.init_services import (
+from boaresearch.init import (
     default_repo_analysis,
     default_selection_for_repo,
     detect_repo,
@@ -68,7 +68,7 @@ class RunnerTests(unittest.TestCase):
         plan = merge_reviewed_plan(selection, analysis)
         write_contract_files(plan)
         config = load_config(repo)
-        self.assertEqual(config.schema_version, 2)
+        self.assertEqual(config.schema_version, 3)
         report = validate_written_setup(plan)
         self.assertTrue(report.passed)
 

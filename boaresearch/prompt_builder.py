@@ -4,7 +4,50 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .schema import AgentContext, OPERATION_TYPES, PATCH_CATEGORIES
+from .prompt_templates import render_prompt_template
+from .schema import AgentExecutionContext, AgentPlanningContext, OPERATION_TYPES, PATCH_CATEGORIES
+
+
+PLAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "hypothesis",
+        "rationale_summary",
+        "selected_parent_branch",
+        "patch_category",
+        "operation_type",
+        "estimated_risk",
+        "informed_by_call_ids",
+    ],
+    "properties": {
+        "hypothesis": {"type": "string"},
+        "rationale_summary": {"type": "string"},
+        "selected_parent_branch": {"type": "string"},
+        "selected_parent_trial_id": {"type": ["string", "null"]},
+        "patch_category": {"type": "string", "enum": sorted(PATCH_CATEGORIES)},
+        "operation_type": {"type": "string", "enum": sorted(OPERATION_TYPES)},
+        "estimated_risk": {"type": "number"},
+        "target_symbols": {"type": "array", "items": {"type": "string"}},
+        "numeric_knobs": {"type": "object", "additionalProperties": {"type": "number"}},
+        "notes": {"type": ["string", "null"]},
+        "informed_by_call_ids": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+
+PLAN_EXAMPLE = {
+    "hypothesis": "A shorter warmup and stronger weight decay should reduce overfitting.",
+    "rationale_summary": "Start from the best optimizer lineage and probe a tighter regularization schedule.",
+    "selected_parent_branch": "boa/demo/trial/demo-0007",
+    "selected_parent_trial_id": "demo-0007",
+    "patch_category": "optimizer",
+    "operation_type": "replace",
+    "estimated_risk": 0.28,
+    "target_symbols": ["Trainer.train_epoch"],
+    "numeric_knobs": {"learning_rate": 0.0002, "weight_decay": 0.02, "warmup_steps": 250},
+    "notes": "Keep dataset code unchanged.",
+    "informed_by_call_ids": ["boa-call-abc123def456"],
+}
 
 
 CANDIDATE_SCHEMA: dict[str, Any] = {
@@ -15,6 +58,7 @@ CANDIDATE_SCHEMA: dict[str, Any] = {
         "patch_category",
         "operation_type",
         "estimated_risk",
+        "informed_by_call_ids",
     ],
     "properties": {
         "hypothesis": {"type": "string"},
@@ -25,6 +69,7 @@ CANDIDATE_SCHEMA: dict[str, Any] = {
         "target_symbols": {"type": "array", "items": {"type": "string"}},
         "numeric_knobs": {"type": "object", "additionalProperties": {"type": "number"}},
         "notes": {"type": ["string", "null"]},
+        "informed_by_call_ids": {"type": "array", "items": {"type": "string"}},
     },
 }
 
@@ -38,6 +83,7 @@ CANDIDATE_EXAMPLE = {
     "target_symbols": ["Trainer.train_epoch"],
     "numeric_knobs": {"learning_rate": 0.0002, "weight_decay": 0.02, "warmup_steps": 250},
     "notes": "Keep dataset code unchanged.",
+    "informed_by_call_ids": ["boa-call-abc123def456", "boa-call-fed654cba321"],
 }
 
 
@@ -58,28 +104,46 @@ def _display_path(path: Path, repo_root: Path) -> str:
         return str(path)
 
 
-def build_agent_system_prompt(*, repo_root: Path, context: AgentContext) -> str:
-    sections = [
-        "You are the patch-authoring agent inside BOA (Bayesian Optimized Agents).",
-        "BOA decides search direction, branch lineage, evaluation stages, and acceptance. You only author a candidate patch in the provided trial worktree.",
-        "Respect the repository contract in boa.md and the machine-enforced path guardrails.",
-        f"Accepted branch: {context.accepted_branch}",
-        f"Trial branch: {context.trial_branch}",
-        f"Allowed paths: {', '.join(context.allowed_paths) if context.allowed_paths else '<all tracked paths>'}",
-        f"Protected paths: {', '.join(context.protected_paths) if context.protected_paths else '<none>'}",
-        f"Primary contract ({_display_path(context.boa_md_path, repo_root)}):\n```\n{_read_text(context.boa_md_path, limit=None)}\n```",
-    ]
+def _supplemental_sections(*, repo_root: Path, extra_context_files: list[Path]) -> str:
+    sections: list[str] = []
     agents_md = repo_root / "AGENTS.md"
     if agents_md.exists():
         sections.append(f"Supplemental repo instructions (AGENTS.md):\n```\n{_read_text(agents_md)}\n```")
-    if context.extra_context_files:
-        for path in context.extra_context_files:
-            sections.append(f"Extra context ({_display_path(path, repo_root)}):\n```\n{_read_text(path)}\n```")
-    return "\n\n".join(sections)
+    for path in extra_context_files:
+        sections.append(f"Extra context ({_display_path(path, repo_root)}):\n```\n{_read_text(path)}\n```")
+    return "\n\n".join(sections) if sections else "<no supplemental repo instructions>"
 
 
-def build_agent_task(context: AgentContext) -> str:
-    recent_lines: list[str] = []
+def build_planning_system_prompt(*, repo_root: Path, context: AgentPlanningContext) -> str:
+    return render_prompt_template(
+        "agent",
+        "planning_system.md",
+        accepted_branch=context.accepted_branch,
+        allowed_paths=", ".join(context.allowed_paths) if context.allowed_paths else "<all tracked paths>",
+        protected_paths=", ".join(context.protected_paths) if context.protected_paths else "<none>",
+        boa_md_display_path=_display_path(context.boa_md_path, repo_root),
+        boa_md_text=_read_text(context.boa_md_path, limit=None),
+        supplemental_sections=_supplemental_sections(repo_root=repo_root, extra_context_files=context.extra_context_files),
+    )
+
+
+def build_execution_system_prompt(*, repo_root: Path, context: AgentExecutionContext) -> str:
+    return render_prompt_template(
+        "agent",
+        "execution_system.md",
+        accepted_branch=context.accepted_branch,
+        allowed_paths=", ".join(context.allowed_paths) if context.allowed_paths else "<all tracked paths>",
+        protected_paths=", ".join(context.protected_paths) if context.protected_paths else "<none>",
+        boa_md_display_path=_display_path(context.boa_md_path, repo_root),
+        boa_md_text=_read_text(context.boa_md_path, limit=None),
+        supplemental_sections=_supplemental_sections(repo_root=repo_root, extra_context_files=context.extra_context_files),
+        parent_branch=context.parent_branch,
+        trial_branch=context.trial_branch,
+    )
+
+
+def build_planning_task(context: AgentPlanningContext) -> str:
+    recent_lines = []
     for trial in context.recent_trials:
         recent_lines.append(
             " | ".join(
@@ -93,37 +157,75 @@ def build_agent_task(context: AgentContext) -> str:
                 ]
             )
         )
-    if not recent_lines:
-        recent_lines = ["<no prior trials recorded>"]
-
-    hints = context.search_decision.prompt_hints or ["<no additional search hints>"]
-    sections = [
-        f"Trial id: {context.trial_id}",
-        context.objective_summary,
-        f"Search policy: {context.search_decision.policy}",
-        f"Parent branch: {context.search_decision.parent_branch}",
-        f"Parent trial: {context.search_decision.parent_trial_id or 'none'}",
-        f"Patch category hint: {context.search_decision.patch_category_hint or 'none'}",
-        "Search hints:",
-        "\n".join(f"- {hint}" for hint in hints),
-        "Recent trials:",
-        "\n".join(recent_lines),
-        "Preflight commands:",
-        "\n".join(context.preflight_commands) if context.preflight_commands else "<none>",
-        "Requirements:",
-        "1. Edit only inside the provided trial worktree.",
-        "2. Do not touch protected paths.",
-        "3. Keep the candidate coherent with the search guidance.",
-        "4. Run the configured preflight commands before finalizing.",
-        "5. Write exactly one candidate metadata JSON object to the provided output path and print the same JSON to stdout as a fallback.",
-        "6. Do not commit or push; BOA owns branching, commits, and acceptance.",
-    ]
-    return "\n\n".join(sections)
+    return render_prompt_template(
+        "agent",
+        "planning_task.md",
+        trial_id=context.trial_id,
+        objective_summary=context.objective_summary,
+        recent_trials="\n".join(recent_lines) if recent_lines else "<no prior trials recorded>",
+    )
 
 
-def build_cli_prompt_bundle(*, repo_root: Path, context: AgentContext) -> dict[str, str]:
-    system_prompt = build_agent_system_prompt(repo_root=repo_root, context=context)
-    task_prompt = build_agent_task(context)
+def build_execution_task(context: AgentExecutionContext) -> str:
+    recent_lines = []
+    for trial in context.recent_trials:
+        recent_lines.append(
+            " | ".join(
+                [
+                    trial.trial_id,
+                    trial.acceptance_status,
+                    trial.canonical_stage or "-",
+                    "" if trial.canonical_score is None else f"{trial.canonical_score:.6f}",
+                    trial.descriptor.patch_category if trial.descriptor else "-",
+                    trial.candidate.rationale_summary if trial.candidate else "-",
+                ]
+            )
+        )
+    return render_prompt_template(
+        "agent",
+        "execution_task.md",
+        trial_id=context.trial_id,
+        objective_summary=context.objective_summary,
+        parent_branch=context.parent_branch,
+        parent_trial_id=context.parent_trial_id or "none",
+        candidate_plan_json=json.dumps(context.candidate_plan.__dict__, indent=2, sort_keys=True),
+        recent_trials="\n".join(recent_lines) if recent_lines else "<no prior trials recorded>",
+        preflight_commands="\n".join(context.preflight_commands) if context.preflight_commands else "<none>",
+    )
+
+
+def build_cli_planning_bundle(*, repo_root: Path, context: AgentPlanningContext) -> dict[str, str]:
+    system_prompt = build_planning_system_prompt(repo_root=repo_root, context=context)
+    task_prompt = build_planning_task(context)
+    output_instructions = "\n\n".join(
+        [
+            "Candidate plan schema:",
+            f"```json\n{json.dumps(PLAN_SCHEMA, indent=2, sort_keys=True)}\n```",
+            "Example candidate plan:",
+            f"```json\n{json.dumps(PLAN_EXAMPLE, indent=2, sort_keys=True)}\n```",
+        ]
+    )
+    combined = "\n\n".join(
+        [
+            "SYSTEM PROMPT",
+            system_prompt,
+            "TASK PROMPT",
+            task_prompt,
+            output_instructions,
+        ]
+    )
+    return {
+        "system_prompt": system_prompt,
+        "task_prompt": task_prompt,
+        "combined_prompt": combined,
+        "plan_schema": json.dumps(PLAN_SCHEMA, indent=2, sort_keys=True),
+        "plan_example": json.dumps(PLAN_EXAMPLE, indent=2, sort_keys=True),
+    }
+
+
+def build_cli_execution_bundle(*, repo_root: Path, context: AgentExecutionContext) -> dict[str, str]:
+    system_prompt = build_execution_system_prompt(repo_root=repo_root, context=context)
+    task_prompt = build_execution_task(context)
     output_instructions = "\n\n".join(
         [
             "Candidate metadata schema:",

@@ -4,8 +4,45 @@ import json
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from .base import ResearchAgentError
-from ..schema import CandidateMetadata, OPERATION_TYPES, PATCH_CATEGORIES
+from .base import ResearchAgentError, parse_candidate_dict, parse_candidate_plan_dict
+from ..schema import CandidateMetadata, CandidatePlan
+from ..search import SearchToolbox
+
+
+@dataclass
+class CandidatePlanSubmissionRecorder:
+    plan: Optional[CandidatePlan] = None
+
+    def submit(
+        self,
+        *,
+        hypothesis: str,
+        rationale_summary: str,
+        selected_parent_branch: str,
+        selected_parent_trial_id: Optional[str] = None,
+        patch_category: str,
+        operation_type: str,
+        estimated_risk: float,
+        target_symbols: Optional[list[str]] = None,
+        numeric_knobs: Optional[dict[str, float]] = None,
+        notes: Optional[str] = None,
+        informed_by_call_ids: Optional[list[str]] = None,
+    ) -> None:
+        self.plan = parse_candidate_plan_dict(
+            {
+                "hypothesis": hypothesis,
+                "rationale_summary": rationale_summary,
+                "selected_parent_branch": selected_parent_branch,
+                "selected_parent_trial_id": selected_parent_trial_id,
+                "patch_category": patch_category,
+                "operation_type": operation_type,
+                "estimated_risk": estimated_risk,
+                "target_symbols": target_symbols or [],
+                "numeric_knobs": numeric_knobs or {},
+                "notes": notes,
+                "informed_by_call_ids": informed_by_call_ids or [],
+            }
+        )
 
 
 @dataclass
@@ -23,30 +60,20 @@ class CandidateSubmissionRecorder:
         target_symbols: Optional[list[str]] = None,
         numeric_knobs: Optional[dict[str, float]] = None,
         notes: Optional[str] = None,
+        informed_by_call_ids: Optional[list[str]] = None,
     ) -> None:
-        category = str(patch_category).strip().lower()
-        operation = str(operation_type).strip().lower()
-        if category not in PATCH_CATEGORIES:
-            known = ", ".join(sorted(PATCH_CATEGORIES))
-            raise ResearchAgentError(f"Unsupported patch_category '{category}'. Expected one of: {known}")
-        if operation not in OPERATION_TYPES:
-            known = ", ".join(sorted(OPERATION_TYPES))
-            raise ResearchAgentError(f"Unsupported operation_type '{operation}'. Expected one of: {known}")
-        knobs = numeric_knobs or {}
-        if not isinstance(knobs, dict):
-            raise ResearchAgentError("numeric_knobs must be a mapping")
-        normalized_knobs: dict[str, float] = {}
-        for key, value in knobs.items():
-            normalized_knobs[str(key)] = float(value)
-        self.candidate = CandidateMetadata(
-            hypothesis=str(hypothesis).strip(),
-            rationale_summary=str(rationale_summary).strip(),
-            patch_category=category,
-            operation_type=operation,
-            estimated_risk=float(estimated_risk),
-            target_symbols=[str(item).strip() for item in list(target_symbols or []) if str(item).strip()],
-            numeric_knobs=normalized_knobs,
-            notes=None if notes is None else str(notes).strip() or None,
+        self.candidate = parse_candidate_dict(
+            {
+                "hypothesis": hypothesis,
+                "rationale_summary": rationale_summary,
+                "patch_category": patch_category,
+                "operation_type": operation_type,
+                "estimated_risk": estimated_risk,
+                "target_symbols": target_symbols or [],
+                "numeric_knobs": numeric_knobs or {},
+                "notes": notes,
+                "informed_by_call_ids": informed_by_call_ids or [],
+            }
         )
 
 
@@ -55,12 +82,47 @@ class AgentToolHarness:
         self,
         *,
         run_preflight: Callable[[], None],
-        read_recent_trials: Callable[[int], list[dict[str, str]]],
-        submission: CandidateSubmissionRecorder,
+        search_tools: SearchToolbox,
+        plan_submission: CandidatePlanSubmissionRecorder | None = None,
+        candidate_submission: CandidateSubmissionRecorder | None = None,
     ) -> None:
         self._run_preflight = run_preflight
-        self._read_recent_trials = read_recent_trials
-        self._submission = submission
+        self._search_tools = search_tools
+        self._plan_submission = plan_submission
+        self._candidate_submission = candidate_submission
+
+    @staticmethod
+    def _json_text(payload: dict[str, object]) -> str:
+        return json.dumps(payload, indent=2, sort_keys=True)
+
+    @staticmethod
+    def _descriptor_request(
+        *,
+        patch_category: str = "misc",
+        operation_type: str = "replace",
+        estimated_risk: float = 0.25,
+        target_symbols: Optional[list[str]] = None,
+        numeric_knobs: Optional[dict[str, float]] = None,
+        touched_files: Optional[list[str]] = None,
+        parent_branch: Optional[str] = None,
+        parent_trial_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "patch_category": patch_category,
+            "operation_type": operation_type,
+            "estimated_risk": estimated_risk,
+            "target_symbols": list(target_symbols or []),
+            "numeric_knobs": dict(numeric_knobs or {}),
+            "touched_files": list(touched_files or []),
+        }
+        if parent_branch:
+            payload["parent_branch"] = parent_branch
+        if parent_trial_id:
+            payload["parent_trial_id"] = parent_trial_id
+        if limit is not None:
+            payload["limit"] = int(limit)
+        return payload
 
     def run_preflight(self) -> str:
         try:
@@ -69,11 +131,143 @@ class AgentToolHarness:
             return f"Preflight failed: {type(exc).__name__}: {exc}"
         return "Preflight passed."
 
-    def read_recent_trials(self, limit: int = 10) -> str:
-        rows = self._read_recent_trials(max(1, int(limit)))
-        if not rows:
-            return "<no prior trials recorded>"
-        return json.dumps(rows, indent=2, sort_keys=True)
+    def recent_trials(self, limit: int = 10) -> str:
+        return self._json_text(self._search_tools.recent_trials({"limit": max(1, int(limit))}))
+
+    def list_lineage_options(self, limit: int = 10) -> str:
+        return self._json_text(self._search_tools.list_lineage_options({"limit": max(1, int(limit))}))
+
+    def suggest_parents(
+        self,
+        patch_category: str = "misc",
+        operation_type: str = "replace",
+        estimated_risk: float = 0.25,
+        target_symbols: Optional[list[str]] = None,
+        numeric_knobs: Optional[dict[str, float]] = None,
+        touched_files: Optional[list[str]] = None,
+        parent_branch: Optional[str] = None,
+        parent_trial_id: Optional[str] = None,
+        limit: int = 5,
+    ) -> str:
+        return self._json_text(
+            self._search_tools.suggest_parents(
+                self._descriptor_request(
+                    patch_category=patch_category,
+                    operation_type=operation_type,
+                    estimated_risk=estimated_risk,
+                    target_symbols=target_symbols,
+                    numeric_knobs=numeric_knobs,
+                    touched_files=touched_files,
+                    parent_branch=parent_branch,
+                    parent_trial_id=parent_trial_id,
+                    limit=limit,
+                )
+            )
+        )
+
+    def score_candidate_descriptor(
+        self,
+        patch_category: str,
+        operation_type: str,
+        estimated_risk: float,
+        target_symbols: Optional[list[str]] = None,
+        numeric_knobs: Optional[dict[str, float]] = None,
+        touched_files: Optional[list[str]] = None,
+        parent_branch: Optional[str] = None,
+        parent_trial_id: Optional[str] = None,
+    ) -> str:
+        return self._json_text(
+            self._search_tools.score_candidate_descriptor(
+                self._descriptor_request(
+                    patch_category=patch_category,
+                    operation_type=operation_type,
+                    estimated_risk=estimated_risk,
+                    target_symbols=target_symbols,
+                    numeric_knobs=numeric_knobs,
+                    touched_files=touched_files,
+                    parent_branch=parent_branch,
+                    parent_trial_id=parent_trial_id,
+                )
+            )
+        )
+
+    def rank_patch_families(
+        self,
+        operation_type: str = "replace",
+        estimated_risk: float = 0.25,
+        target_symbols: Optional[list[str]] = None,
+        numeric_knobs: Optional[dict[str, float]] = None,
+        touched_files: Optional[list[str]] = None,
+        parent_branch: Optional[str] = None,
+        parent_trial_id: Optional[str] = None,
+        limit: int = 5,
+    ) -> str:
+        request = self._descriptor_request(
+            operation_type=operation_type,
+            estimated_risk=estimated_risk,
+            target_symbols=target_symbols,
+            numeric_knobs=numeric_knobs,
+            touched_files=touched_files,
+            parent_branch=parent_branch,
+            parent_trial_id=parent_trial_id,
+            limit=limit,
+        )
+        request.pop("patch_category", None)
+        return self._json_text(self._search_tools.rank_patch_families(request))
+
+    def propose_numeric_knob_regions(
+        self,
+        patch_category: str = "misc",
+        operation_type: str = "replace",
+        estimated_risk: float = 0.25,
+        numeric_knobs: Optional[dict[str, float]] = None,
+        parent_branch: Optional[str] = None,
+        parent_trial_id: Optional[str] = None,
+        limit: int = 5,
+    ) -> str:
+        request = self._descriptor_request(
+            patch_category=patch_category,
+            operation_type=operation_type,
+            estimated_risk=estimated_risk,
+            numeric_knobs=numeric_knobs,
+            parent_branch=parent_branch,
+            parent_trial_id=parent_trial_id,
+            limit=limit,
+        )
+        request.pop("target_symbols", None)
+        request.pop("touched_files", None)
+        return self._json_text(self._search_tools.propose_numeric_knob_regions(request))
+
+    def submit_candidate_plan(
+        self,
+        hypothesis: str,
+        rationale_summary: str,
+        selected_parent_branch: str,
+        patch_category: str,
+        operation_type: str,
+        estimated_risk: float,
+        informed_by_call_ids: list[str],
+        selected_parent_trial_id: Optional[str] = None,
+        target_symbols: Optional[list[str]] = None,
+        numeric_knobs: Optional[dict[str, float]] = None,
+        notes: Optional[str] = None,
+    ) -> str:
+        if self._plan_submission is None:
+            raise ResearchAgentError("submit_candidate_plan is not available in this phase")
+        self._plan_submission.submit(
+            hypothesis=hypothesis,
+            rationale_summary=rationale_summary,
+            selected_parent_branch=selected_parent_branch,
+            selected_parent_trial_id=selected_parent_trial_id,
+            patch_category=patch_category,
+            operation_type=operation_type,
+            estimated_risk=estimated_risk,
+            target_symbols=target_symbols,
+            numeric_knobs=numeric_knobs,
+            notes=notes,
+            informed_by_call_ids=informed_by_call_ids,
+        )
+        return "Candidate plan recorded."
 
     def submit_candidate(
         self,
@@ -82,11 +276,14 @@ class AgentToolHarness:
         patch_category: str,
         operation_type: str,
         estimated_risk: float,
+        informed_by_call_ids: list[str],
         target_symbols: Optional[list[str]] = None,
         numeric_knobs: Optional[dict[str, float]] = None,
         notes: Optional[str] = None,
     ) -> str:
-        self._submission.submit(
+        if self._candidate_submission is None:
+            raise ResearchAgentError("submit_candidate is not available in this phase")
+        self._candidate_submission.submit(
             hypothesis=hypothesis,
             rationale_summary=rationale_summary,
             patch_category=patch_category,
@@ -95,6 +292,7 @@ class AgentToolHarness:
             target_symbols=target_symbols,
             numeric_knobs=numeric_knobs,
             notes=notes,
+            informed_by_call_ids=informed_by_call_ids,
         )
         return "Candidate metadata recorded."
 
@@ -107,9 +305,52 @@ def _wrap_tool(func, *, name: str, description: str):
     return tool(name_or_callable=name, description=description)(func)
 
 
-def build_agent_tools(harness: AgentToolHarness) -> list[object]:
-    return [
-        _wrap_tool(harness.run_preflight, name="run_preflight", description="Run the configured preflight commands."),
-        _wrap_tool(harness.read_recent_trials, name="read_recent_trials", description="Read recent BOA trial summaries."),
-        _wrap_tool(harness.submit_candidate, name="submit_candidate", description="Submit the candidate metadata after edits and preflight are complete."),
+def build_agent_tools(harness: AgentToolHarness, *, phase: str) -> list[object]:
+    tools = [
+        _wrap_tool(harness.recent_trials, name="recent_trials", description="Read recent BOA trial summaries."),
+        _wrap_tool(
+            harness.list_lineage_options,
+            name="list_lineage_options",
+            description="List BOA-known parent lineage options for the current run.",
+        ),
+        _wrap_tool(
+            harness.suggest_parents,
+            name="suggest_parents",
+            description="Rank parent branches using the BOA Bayesian oracle.",
+        ),
+        _wrap_tool(
+            harness.score_candidate_descriptor,
+            name="score_candidate_descriptor",
+            description="Score a draft patch descriptor with the BOA Bayesian oracle.",
+        ),
+        _wrap_tool(
+            harness.rank_patch_families,
+            name="rank_patch_families",
+            description="Rank patch families using BOA search memory.",
+        ),
+        _wrap_tool(
+            harness.propose_numeric_knob_regions,
+            name="propose_numeric_knob_regions",
+            description="Suggest numeric knob regions from BOA trial memory.",
+        ),
     ]
+    if phase == "planning":
+        tools.append(
+            _wrap_tool(
+                harness.submit_candidate_plan,
+                name="submit_candidate_plan",
+                description="Submit the candidate plan after selecting a parent branch and BO-informed strategy.",
+            )
+        )
+        return tools
+    tools.extend(
+        [
+            _wrap_tool(harness.run_preflight, name="run_preflight", description="Run the configured preflight commands."),
+            _wrap_tool(
+                harness.submit_candidate,
+                name="submit_candidate",
+                description="Submit the final candidate metadata after edits and preflight are complete.",
+            ),
+        ]
+    )
+    return tools
