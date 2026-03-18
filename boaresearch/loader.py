@@ -62,7 +62,10 @@ def _resolve_local_path(path: Path | None, repo_root: Path) -> Path | None:
 def _normalize_path_prefixes(values: list[str] | None) -> list[str]:
     normalized: list[str] = []
     for raw in values or []:
-        cleaned = str(raw).replace("\\", "/").strip().lstrip("./").rstrip("/")
+        cleaned = str(raw).replace("\\", "/").strip()
+        while cleaned.startswith("./"):
+            cleaned = cleaned[2:]
+        cleaned = cleaned.rstrip("/")
         if cleaned:
             normalized.append(cleaned)
     return normalized

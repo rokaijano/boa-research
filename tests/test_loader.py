@@ -86,8 +86,21 @@ class LoaderTests(unittest.TestCase):
         self.assertEqual(config.runner.mode, "local")
         self.assertEqual(config.run.accepted_branch, "boa/demo/accepted")
         self.assertEqual(config.guardrails.allowed_paths, ["src"])
+        self.assertEqual(config.guardrails.protected_paths, [".boa"])
         self.assertEqual(config.search.oracle, "bayesian_optimization")
         self.assertTrue(str(config.run.worktree_path).endswith("/.boa/worktrees/demo"))
+
+    def test_hidden_paths_are_not_stripped_during_normalization(self) -> None:
+        repo = self._make_repo(mode="local")
+        (repo / "boa.config").write_text(
+            (repo / "boa.config").read_text(encoding="utf-8").replace(
+                'protected_paths = [".boa"]',
+                'protected_paths = ["./.boa", "./.gitignore"]',
+            ),
+            encoding="utf-8",
+        )
+        config = load_config(repo)
+        self.assertEqual(config.guardrails.protected_paths, [".boa", ".gitignore"])
 
     def test_load_config_from_repo_root_ssh(self) -> None:
         repo = self._make_repo(mode="ssh")

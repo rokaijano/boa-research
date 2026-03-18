@@ -103,10 +103,126 @@ def _first_existing(repo_root: Path, candidates: list[str]) -> Optional[str]:
 def _normalize_paths(values: list[str]) -> list[str]:
     normalized: list[str] = []
     for raw in values:
-        cleaned = str(raw).replace("\\", "/").strip().lstrip("./").rstrip("/")
+        cleaned = str(raw).replace("\\", "/").strip()
+        while cleaned.startswith("./"):
+            cleaned = cleaned[2:]
+        cleaned = cleaned.rstrip("/")
         if cleaned and cleaned not in normalized:
             normalized.append(cleaned)
     return normalized
+
+
+def _looks_like_data_path(path: str) -> bool:
+    normalized = _normalize_paths([path])
+    if not normalized:
+        return False
+    value = normalized[0]
+    parts = [part.lower() for part in value.split("/") if part]
+    if not parts:
+        return False
+    data_names = {
+        "data",
+        "dataset",
+        "datasets",
+        "corpus",
+        "corpora",
+        "raw_data",
+        "processed_data",
+        "sample_data",
+        "fixtures_data",
+    }
+    if any(part in data_names for part in parts):
+        return True
+    suffix = Path(value).suffix.lower()
+    return suffix in {
+        ".csv",
+        ".tsv",
+        ".jsonl",
+        ".parquet",
+        ".feather",
+        ".arrow",
+        ".npy",
+        ".npz",
+        ".pt",
+        ".pth",
+        ".ckpt",
+        ".h5",
+        ".hdf5",
+        ".pkl",
+        ".pickle",
+        ".joblib",
+        ".onnx",
+        ".bin",
+        ".gz",
+        ".bz2",
+        ".xz",
+        ".zip",
+        ".tar",
+        ".tgz",
+    }
+
+
+def _looks_like_eval_path(path: str) -> bool:
+    normalized = _normalize_paths([path])
+    if not normalized:
+        return False
+    value = normalized[0]
+    name = Path(value).name.lower()
+    eval_names = {
+        "eval.py",
+        "evaluate.py",
+        "evaluation.py",
+        "eval.sh",
+        "evaluate.sh",
+        "evaluation.sh",
+    }
+    return name in eval_names
+
+
+def _is_sensitive_path(path: str) -> bool:
+    normalized = _normalize_paths([path])
+    if not normalized:
+        return False
+    value = normalized[0]
+    return value in {".boa", ".git"} or _looks_like_eval_path(value) or _looks_like_data_path(value)
+
+
+def _default_editable_paths(repo_root: Path) -> list[str]:
+    editable: list[str] = []
+    for top_level in ("src", "app"):
+        if (repo_root / top_level).exists():
+            editable.append(top_level)
+    if editable:
+        return editable
+    for candidate in sorted(repo_root.iterdir()):
+        if not candidate.is_dir():
+            continue
+        if candidate.name in {".git", ".boa", "tests", "docs", "reports", "artifacts", "build", "dist", "vendor", "node_modules"}:
+            continue
+        editable.append(candidate.name)
+        if len(editable) >= 3:
+            break
+    if editable:
+        return editable
+    if (repo_root / "train").exists():
+        return ["train"]
+    return ["src"]
+
+
+def _default_protected_paths(repo_root: Path, *, metric_path: str | None) -> list[str]:
+    protected = [".boa", ".git"]
+    for candidate in ("eval.py", "evaluate.py", "evaluation.py", "src/eval.py", "src/evaluate.py", "src/evaluation.py"):
+        if (repo_root / candidate).exists():
+            protected.append(candidate)
+    for candidate in sorted(repo_root.iterdir()):
+        if not candidate.exists():
+            continue
+        rel = candidate.relative_to(repo_root).as_posix()
+        if _looks_like_data_path(rel):
+            protected.append(rel)
+    if metric_path:
+        protected.append(metric_path)
+    return _normalize_paths(protected)
 
 
 def _normalize_aggressiveness(value: str) -> str:
@@ -418,16 +534,8 @@ def default_repo_analysis(repo_root: Path) -> RepoAnalysisProposal:
     train_file = _first_existing(repo_root, ["train.py", "src/train.py", "main.py"])
     eval_file = _first_existing(repo_root, ["eval.py", "evaluate.py", "src/eval.py"])
     metric_json = _first_existing(repo_root, ["reports/metrics.json", "metrics.json", "artifacts/metrics.json"])
-    editable: list[str] = []
-    for top_level in ("src", "app", "boa", "train", "tests"):
-        if (repo_root / top_level).exists():
-            editable.append(top_level)
-    if not editable:
-        editable = [path.name for path in repo_root.iterdir() if path.is_dir() and path.name not in {".git", ".boa"}][:3]
-    protected = [".boa", ".git"]
-    for candidate in ("vendor", "node_modules", "dist", "build"):
-        if (repo_root / candidate).exists():
-            protected.append(candidate)
+    editable = _default_editable_paths(repo_root)
+    protected = _default_protected_paths(repo_root, metric_path=metric_json)
     optimization_surfaces = [item for item in editable if item not in {"tests"}]
     caveats: list[str] = []
     if train_file is None:
@@ -633,8 +741,28 @@ def analyze_repo(detected: DetectedRepo, selection: InitSetupSelection) -> RepoA
 
 
 def merge_reviewed_plan(selection: InitSetupSelection, analysis: RepoAnalysisProposal) -> ReviewedInitPlan:
-    editable = _normalize_paths(analysis.editable_files or ["src"])
-    protected = _normalize_paths(list({".boa", ".git", *analysis.protected_files}))
+    protected_candidates = list(analysis.protected_files)
+    metric_path = analysis.metric_path
+    if metric_path:
+        protected_candidates.append(metric_path)
+    protected = _normalize_paths(
+        list(
+            {
+                ".boa",
+                ".git",
+                *protected_candidates,
+            }
+        )
+    )
+    editable = []
+    for path in _normalize_paths(analysis.editable_files or _default_editable_paths(selection.repo_root)):
+        if _is_sensitive_path(path):
+            if path not in protected:
+                protected.append(path)
+            continue
+        editable.append(path)
+    if not editable:
+        editable = [path for path in _default_editable_paths(selection.repo_root) if path not in protected]
     boa_md = analysis.suggested_boa_md.strip() or default_repo_analysis(selection.repo_root).suggested_boa_md
     return ReviewedInitPlan(
         repo_root=selection.repo_root,

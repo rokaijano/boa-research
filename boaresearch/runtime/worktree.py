@@ -16,7 +16,9 @@ class WorktreeError(RuntimeError):
 
 
 def _normalize_repo_path(path: str) -> str:
-    normalized = str(PurePosixPath(str(path).replace("\\", "/"))).lstrip("./")
+    normalized = str(PurePosixPath(str(path).replace("\\", "/"))).strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
     return normalized
 
 

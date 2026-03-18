@@ -6,7 +6,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from boaresearch.init import build_config_from_plan, default_selection_for_repo, detect_repo, merge_reviewed_plan, render_boa_md, render_config_text
+from boaresearch.init import build_config_from_plan, default_repo_analysis, default_selection_for_repo, detect_repo, merge_reviewed_plan, render_boa_md, render_config_text
 from boaresearch.loader import load_config
 from boaresearch.init.models import InitSetupSelection, RepoAnalysisProposal, ReviewedInitPlan
 
@@ -213,6 +213,63 @@ class InitServicesTests(unittest.TestCase):
         self.assertEqual(loaded.objective.threshold, 0.8)
         self.assertEqual(loaded.search.seed, 11)
         self.assertEqual([metric.name for metric in loaded.metrics], ["accuracy", "latency"])
+
+    def test_default_repo_analysis_protects_eval_and_metric_outputs(self) -> None:
+        repo_root = Path(tempfile.mkdtemp())
+        (repo_root / "src").mkdir()
+        (repo_root / "data").mkdir()
+        (repo_root / "tests").mkdir()
+        (repo_root / "reports").mkdir()
+        (repo_root / "README.md").write_text("# demo\n", encoding="utf-8")
+        (repo_root / "train.py").write_text("print('train')\n", encoding="utf-8")
+        (repo_root / "eval.py").write_text("print('eval')\n", encoding="utf-8")
+        (repo_root / "data" / "train.csv").write_text("x,y\n1,0\n", encoding="utf-8")
+        (repo_root / "reports" / "metrics.json").write_text('{"accuracy": 1.0}\n', encoding="utf-8")
+
+        analysis = default_repo_analysis(repo_root)
+
+        self.assertEqual(analysis.editable_files, ["src"])
+        self.assertIn(".boa", analysis.protected_files)
+        self.assertIn(".git", analysis.protected_files)
+        self.assertIn("eval.py", analysis.protected_files)
+        self.assertIn("data", analysis.protected_files)
+        self.assertIn("reports/metrics.json", analysis.protected_files)
+        self.assertNotIn(".gitignore", analysis.protected_files)
+        self.assertNotIn("train.py", analysis.protected_files)
+        self.assertNotIn("tests", analysis.protected_files)
+        self.assertNotIn("README.md", analysis.protected_files)
+
+    def test_merge_reviewed_plan_moves_sensitive_paths_to_protected(self) -> None:
+        repo_root = Path(tempfile.mkdtemp())
+        (repo_root / "src").mkdir()
+        selection = InitSetupSelection(repo_root=repo_root)
+        analysis = RepoAnalysisProposal(
+            train_command="python train.py",
+            eval_command="python eval.py",
+            primary_metric_name="accuracy",
+            metric_direction="maximize",
+            metric_source="json_file",
+            metric_path="reports/metrics.json",
+            metric_json_key="accuracy",
+            metric_pattern=None,
+            editable_files=["src", "eval.py", "data", "train.py", "tests", "README.md", ".boa"],
+            protected_files=[],
+            optimization_surfaces=["src"],
+            caveats=[],
+            suggested_boa_md="# BOA Repo Contract",
+        )
+
+        plan = merge_reviewed_plan(selection, analysis)
+
+        self.assertEqual(plan.editable_files, ["src", "train.py", "tests", "README.md"])
+        self.assertIn(".boa", plan.protected_files)
+        self.assertIn(".git", plan.protected_files)
+        self.assertIn("eval.py", plan.protected_files)
+        self.assertIn("data", plan.protected_files)
+        self.assertIn("reports/metrics.json", plan.protected_files)
+        self.assertNotIn("README.md", plan.protected_files)
+        self.assertNotIn("tests", plan.protected_files)
+        self.assertNotIn("train.py", plan.protected_files)
 
 
 if __name__ == "__main__":
