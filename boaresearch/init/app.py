@@ -274,24 +274,12 @@ class InitWizard:
         selection.agent_env = {}
         selection.agent_profile = None
         selection.agent_model = ""
-        command_missing = shutil.which(default_command) is None
-        agent_name = self._agent_display_name(preset)
-        if command_missing or self.prompts.confirm(
-            message=f"Use a different {agent_name} command or path than `{default_command}`?",
-            default=False,
-        ):
+        if shutil.which(default_command) is None:
+            agent_name = self._agent_display_name(preset)
             selection.agent_command = (
                 self.prompts.text(message=f"{agent_name} command or path", default=default_command) or default_command
             )
         if preset == "codex":
-            profile_mode = self.prompts.select(
-                message="Codex profile",
-                choices=[("Use default profile", "default"), ("Use config profile", "profile")],
-                default="default",
-            )
-            selection.agent_profile = (
-                self.prompts.text(message="Codex profile name", default=selection.agent_profile or "") or None
-            ) if profile_mode == "profile" else None
             discovery = discover_available_models_for_agent(
                 preset=preset,
                 command=selection.agent_command,
@@ -309,14 +297,6 @@ class InitWizard:
                 },
             )
             return
-        profile_mode = self.prompts.select(
-            message="CLI mode",
-            choices=[("Use default mode", "default"), ("Set custom profile / mode", "custom")],
-            default="default",
-        )
-        selection.agent_profile = (
-            self.prompts.text(message="Profile / mode", default=selection.agent_profile or "") or None
-        ) if profile_mode == "custom" else None
         discovery = discover_available_models_for_agent(preset=preset)
         selection.agent_model = self._prompt_for_discovered_model(
             label="Model discovery",
@@ -581,13 +561,15 @@ class InitWizard:
     def _review_plan(self) -> None:
         plan = self.draft.reviewed_plan
         assert plan is not None
+        config = self.services.build_config_from_plan(plan)
         self._show("Proposed setup:")
         self._show(f"- Agent: {plan.selection.agent_preset}")
         self._show(f"- Coding aggressiveness: {plan.selection.agent_aggressiveness}")
         self._show(f"- Runner: {plan.selection.runner_mode}")
-        self._show(f"- Train command: {plan.train_command}")
-        self._show(f"- Eval command: {plan.eval_command}")
         self._show(f"- Primary metric: {plan.primary_metric_name} ({plan.metric_direction})")
+        self._show(f"- Max trials per run: {config.run.max_trials}")
+        self._show(f"- Max consecutive failures: {config.run.max_consecutive_failures}")
+        self._show(f"- Scout stage timeout: {config.runner.scout.timeout_seconds}s")
         self._show(f"- Editable files: {', '.join(plan.editable_files)}")
         self._show(f"- Protected files: {', '.join(plan.protected_files)}")
         if plan.selection.runner_mode == "ssh":
@@ -659,10 +641,9 @@ class InitWizard:
             self._show("Skipped:")
             for path in result.skipped_paths:
                 self._show(f"- {path}")
-        if self.prompts.confirm(message="Run validation now?", default=True):
-            self.draft.validation = self.services.validate_written_setup(plan)
-            for detail in self.draft.validation.details:
-                self._show(f"- {detail}")
+        self.draft.validation = self.services.validate_written_setup(plan)
+        for detail in self.draft.validation.details:
+            self._show(f"- {detail}")
 
     def run(self) -> InitDraft:
         self._print_banner()

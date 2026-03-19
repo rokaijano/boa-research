@@ -40,7 +40,7 @@ Broader rewrites and structural refactors are acceptable when they materially im
 - Pursue the highest-impact changes to model architecture, hyperparameters, and training logic.
 - Structural refactors (e.g., reorganizing the model class, rewriting the training loop) are acceptable when they enable better optimization.
 - Ensure all changes remain testable: smoke tests must continue to pass with `--use-fake-data`.
-- Keep diffs coherent â€” large changes should be logically self-contained and easy to review.
+- Keep diffs coherent — large changes should be logically self-contained and easy to review.
 - Do not rewrite the CLI contract, checkpoint paths, or metric file schema.
 
 ## Agent Edit Strategy
@@ -60,14 +60,14 @@ Broader rewrites and structural refactors are acceptable when they materially im
 - Eval command: `python eval.py --device cpu`
 - Primary metric: `accuracy` (maximize)
 - Editable paths: src/mnist_demo/cli.py, src/mnist_demo/config.py, src/mnist_demo/data.py, src/mnist_demo/model.py, src/mnist_demo/runtime.py, src/mnist_demo/training.py
-- Protected paths: .boa/protected, README.md, .git, requirements.txt, reports/metrics.json, train.py, eval.py, tests/test_smoke.py
+- Protected paths: reports/metrics.json, tests/test_smoke.py, .git, train.py, eval.py, .boa, README.md, .boa/protected, requirements.txt
 - Likely optimization surfaces: learning rate, optimizer choice, batch size, dropout, channel width, weight decay, epoch count, train_size, val_size, CNN architecture, training loop logic, data preprocessing / transforms
 
 ## Caveats
 
-- eval.py requires a checkpoint at artifacts/best_model.pt, so training must run successfully before evaluation.
-- Both train.py and eval.py overwrite reports/metrics.json; BOA should read the post-eval file.
-- Do not use --use-fake-data for scoring runs; fake data is only for smoke tests.
+- eval.py requires artifacts/best_model.pt, so training must complete successfully before evaluation.
+- train.py and eval.py both overwrite reports/metrics.json; BOA should read the post-eval file.
+- Use --use-fake-data only for smoke tests, not scoring runs.
 - The default dataset sizes are train_size=2048 and val_size=512, so reported accuracy is on that configured subset unless defaults change.
-- Real MNIST runs may download data into data/ on the first run.
+- Real MNIST runs may download data into data/ on first run.
 - The default device is auto; pinning --device cpu makes local runs more comparable.

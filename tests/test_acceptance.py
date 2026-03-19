@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from boaresearch.acceptance import AcceptanceEngine
-from boaresearch.schema import BoaConfig, MetricConfig, ObjectiveConfig, RunnerConfig, RunnerStageConfig
+from boaresearch.schema import BoaConfig, IncumbentRecord, MetricConfig, ObjectiveConfig, RunnerConfig, RunnerStageConfig
 
 
 def build_config(direction: str = "maximize") -> BoaConfig:
@@ -52,6 +52,28 @@ class AcceptanceTests(unittest.TestCase):
         )
         self.assertTrue(evaluation.threshold_passed)
         self.assertAlmostEqual(evaluation.adjusted_score, -0.15)
+
+    def test_equal_score_is_not_an_improvement(self) -> None:
+        config = build_config("maximize")
+        config.objective.threshold = None
+        config.objective.cost_penalty_metric = None
+        config.objective.minimum_improvement_delta = 0.0
+        engine = AcceptanceEngine(config)
+        evaluation = engine.evaluate_stage(
+            stage_name="scout",
+            metrics={"accuracy": 0.95},
+            incumbent=IncumbentRecord(
+                stage_name="scout",
+                trial_id="incumbent",
+                branch_name="boa/demo/trial/incumbent",
+                adjusted_score=0.95,
+                primary_metric=0.95,
+                updated_at="2026-03-19T00:00:00+00:00",
+            ),
+        )
+        self.assertFalse(evaluation.improved)
+        self.assertFalse(evaluation.advanced)
+        self.assertFalse(evaluation.final_accept)
 
 
 if __name__ == "__main__":

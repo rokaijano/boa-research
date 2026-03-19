@@ -455,7 +455,16 @@ class BoaController:
             message=f"Baseline ready for stage '{stage_name}'",
             trial_id=trial_id,
             stage_name=stage_name,
-            metadata={"score": evaluation.adjusted_score},
+            metadata={
+                "score": evaluation.adjusted_score,
+                "primary_metric": evaluation.primary_metric,
+                "branch_name": str(self.config.run.accepted_branch),
+                "parent_branch": str(self.config.run.accepted_branch),
+                "parent_trial_id": None,
+                "acceptance_status": "baseline",
+                "canonical_stage": stage_name,
+                "canonical_score": evaluation.adjusted_score,
+            },
         )
 
     def _write_plan_artifact(self, *, trial_id: str, candidate_plan: CandidatePlan) -> None:
@@ -549,9 +558,10 @@ class BoaController:
         trial_id: str,
         trial_branch: str,
         artifact_dir: Path,
-    ) -> tuple[str, str | None, float | None]:
+    ) -> tuple[str, str | None, float | None, float | None]:
         canonical_stage: str | None = None
         canonical_score: float | None = None
+        canonical_primary_metric: float | None = None
         final_accept = False
         highest_stage = self.acceptance.highest_enabled_stage()
         for stage_name in enabled_stages(self.config):
@@ -601,10 +611,10 @@ class BoaController:
                     metadata={"status": execution.status},
                 )
                 if execution.status == "timeout":
-                    return "timed_out", canonical_stage, canonical_score
+                    return "timed_out", canonical_stage, canonical_score, canonical_primary_metric
                 if execution.status == "metric_missing":
-                    return "metric_missing", canonical_stage, canonical_score
-                return "stage_failed", canonical_stage, canonical_score
+                    return "metric_missing", canonical_stage, canonical_score, canonical_primary_metric
+                return "stage_failed", canonical_stage, canonical_score, canonical_primary_metric
             incumbent = self.store.get_incumbent(stage_name)
             evaluation = self.acceptance.evaluate_stage(
                 stage_name=stage_name,
@@ -633,6 +643,7 @@ class BoaController:
             self.store.record_stage_result(trial_id=trial_id, result=stage_result)
             canonical_stage = stage_name
             canonical_score = evaluation.adjusted_score
+            canonical_primary_metric = evaluation.primary_metric
             final_accept = evaluation.final_accept
             self._emit(
                 kind="stage_completed",
@@ -644,7 +655,12 @@ class BoaController:
                 trial_id=trial_id,
                 phase="evaluation",
                 stage_name=stage_name,
-                metadata={"score": evaluation.adjusted_score, "advanced": evaluation.advanced},
+                metadata={
+                    "score": evaluation.adjusted_score,
+                    "primary_metric": evaluation.primary_metric,
+                    "advanced": evaluation.advanced,
+                    "branch_name": trial_branch,
+                },
             )
             if evaluation.improved:
                 self.store.upsert_incumbent(
@@ -657,8 +673,8 @@ class BoaController:
             if not evaluation.advanced:
                 break
         if final_accept and canonical_stage == highest_stage and canonical_score is not None:
-            return "completed_accepted", canonical_stage, canonical_score
-        return "completed_rejected", canonical_stage, canonical_score
+            return "completed_accepted", canonical_stage, canonical_score, canonical_primary_metric
+        return "completed_rejected", canonical_stage, canonical_score, canonical_primary_metric
 
     @staticmethod
     def _classify_failure(exc: Exception) -> str:
@@ -806,7 +822,12 @@ class BoaController:
                     message=f"Planning selected parent branch {candidate_plan.selected_parent_branch}",
                     trial_id=trial_id,
                     phase="planning",
-                    metadata={"parent_branch": candidate_plan.selected_parent_branch},
+                    metadata={
+                        "parent_branch": candidate_plan.selected_parent_branch,
+                        "parent_trial_id": candidate_plan.selected_parent_trial_id,
+                        "patch_category": candidate_plan.patch_category,
+                        "operation_type": candidate_plan.operation_type,
+                    },
                 )
                 self._write_plan_artifact(trial_id=trial_id, candidate_plan=candidate_plan)
                 # Write plan.json from the BOA process so the execution agent can read it,
@@ -828,7 +849,11 @@ class BoaController:
                     message=f"Preparing execution worktree from {parent_branch}",
                     trial_id=trial_id,
                     phase="execution",
-                    metadata={"parent_branch": parent_branch},
+                    metadata={
+                        "parent_branch": parent_branch,
+                        "parent_trial_id": parent_trial_id,
+                        "branch_name": trial_branch,
+                    },
                 )
                 execution_context = self._build_execution_context(
                     trial_id=trial_id,
@@ -871,7 +896,7 @@ class BoaController:
                 self.worktree.commit_trial(self._commit_message(trial_id, candidate))
                 if self.runner.requires_remote_branches:
                     self.worktree.push_branch(remote=self.config.runner.ssh.git_remote, branch=trial_branch, force=True)
-                acceptance_status, canonical_stage, canonical_score = self._evaluate_candidate(
+                acceptance_status, canonical_stage, canonical_score, canonical_primary_metric = self._evaluate_candidate(
                     trial_id=trial_id,
                     trial_branch=trial_branch,
                     artifact_dir=artifact_dir,
@@ -899,7 +924,15 @@ class BoaController:
                     kind="trial_completed",
                     message=f"Trial {trial_id} finished with status {acceptance_status}",
                     trial_id=trial_id,
-                    metadata={"acceptance_status": acceptance_status},
+                    metadata={
+                        "acceptance_status": acceptance_status,
+                        "branch_name": trial_branch,
+                        "parent_branch": parent_branch,
+                        "parent_trial_id": parent_trial_id,
+                        "canonical_stage": canonical_stage,
+                        "canonical_score": canonical_score,
+                        "primary_metric": canonical_primary_metric,
+                    },
                 )
             except PolicyRejectedError as exc:
                 consecutive_failures += 1
@@ -923,7 +956,13 @@ class BoaController:
                     kind="trial_failed",
                     message=f"Trial {trial_id} was policy rejected",
                     trial_id=trial_id,
-                    metadata={"acceptance_status": "policy_rejected", "detail": last_detail or ""},
+                    metadata={
+                        "acceptance_status": "policy_rejected",
+                        "detail": last_detail or "",
+                        "branch_name": trial_branch,
+                        "parent_branch": parent_branch,
+                        "parent_trial_id": parent_trial_id,
+                    },
                 )
                 if consecutive_failures >= int(self.config.run.max_consecutive_failures):
                     raise
@@ -949,7 +988,13 @@ class BoaController:
                     kind="trial_failed",
                     message=f"Trial {trial_id} failed with status {last_acceptance_status}",
                     trial_id=trial_id,
-                    metadata={"acceptance_status": last_acceptance_status or "unknown", "detail": last_detail or ""},
+                    metadata={
+                        "acceptance_status": last_acceptance_status or "unknown",
+                        "detail": last_detail or "",
+                        "branch_name": trial_branch,
+                        "parent_branch": parent_branch,
+                        "parent_trial_id": parent_trial_id,
+                    },
                 )
                 if consecutive_failures >= int(self.config.run.max_consecutive_failures):
                     raise

@@ -1161,5 +1161,6 @@ class InitServices:
     analyze_repo: Callable[[DetectedRepo, InitSetupSelection], RepoAnalysisProposal] = analyze_repo
     default_repo_analysis: Callable[[Path], RepoAnalysisProposal] = default_repo_analysis
     merge_reviewed_plan: Callable[[InitSetupSelection, RepoAnalysisProposal], ReviewedInitPlan] = merge_reviewed_plan
+    build_config_from_plan: Callable[[ReviewedInitPlan], BoaConfig] = build_config_from_plan
     write_contract_files: Callable[[ReviewedInitPlan], WriteResult] = write_contract_files
     validate_written_setup: Callable[[ReviewedInitPlan], ValidationReport] = validate_written_setup

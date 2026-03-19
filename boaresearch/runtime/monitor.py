@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import re
 import sys
 from collections import deque
 from contextlib import AbstractContextManager
 from datetime import datetime
 from typing import TextIO
 
-from ..init.banner import render_banner
 from .observer import NullRunObserver, RunEvent
 
 try:
@@ -14,11 +14,10 @@ try:
     from rich.live import Live
     from rich.panel import Panel
     from rich.table import Table
-    from rich.text import Text
 
     _RICH_AVAILABLE = True
 except ImportError:
-    Console = Group = Live = Panel = Table = Text = None
+    Console = Group = Live = Panel = Table = None
     _RICH_AVAILABLE = False
 
 
@@ -83,16 +82,16 @@ class RichRunObserver(NullRunObserver, AbstractContextManager["RichRunObserver"]
             raise RuntimeError("rich is not available")
         self.stream = stream or sys.stderr
         self.console = Console(file=self.stream)
-        self.events: deque[str] = deque(maxlen=14)
-        self.agent_lines: deque[str] = deque(maxlen=14)
-        self.terminal_lines: deque[str] = deque(maxlen=18)
-        self.bo_lines: deque[str] = deque(maxlen=14)
-        self.summary_lines: deque[str] = deque(maxlen=12)
-        self.completed_trials: deque[tuple[str, str, str]] = deque(maxlen=8)
+        self.activity_lines: deque[str] = deque(maxlen=16)
+        self.error_lines: deque[str] = deque(maxlen=8)
+        self.trial_sequence: list[str] = []
+        self.trials: dict[str, dict[str, object]] = {}
         self.current_trial_id: str | None = None
         self.current_phase: str | None = None
         self.current_stage: str | None = None
         self.current_status = "idle"
+        self.transient_status: str | None = None
+        self.transient_pulse = 0
         self.live = Live(self._render(), console=self.console, refresh_per_second=8, transient=False)
 
     def __enter__(self) -> RichRunObserver:
@@ -107,73 +106,202 @@ class RichRunObserver(NullRunObserver, AbstractContextManager["RichRunObserver"]
     def emit(self, event: RunEvent) -> None:
         if event.trial_id:
             self.current_trial_id = event.trial_id
+            self._ensure_trial(event.trial_id)
         if event.phase:
             self.current_phase = event.phase
         if event.stage_name:
             self.current_stage = event.stage_name
         if event.kind in {"run_started", "trial_started", "planning_started", "execution_started", "stage_started"}:
             self.current_status = event.message
+            self.transient_status = None
         elif event.kind in {"trial_completed", "trial_failed", "run_completed", "run_stopped"}:
             self.current_status = event.message
+            self.transient_status = None
+        self._update_trial_state(event)
+        self._record_event(event)
+        self.live.update(self._render(), refresh=True)
+
+    def _ensure_trial(self, trial_id: str) -> dict[str, object]:
+        if trial_id not in self.trials:
+            self.trials[trial_id] = {
+                "trial_id": trial_id,
+                "branch_name": "",
+                "parent_branch": "",
+                "parent_trial_id": None,
+                "acceptance_status": "running",
+                "canonical_stage": None,
+                "canonical_score": None,
+                "primary_metric": None,
+                "detail": "",
+            }
+            self.trial_sequence.append(trial_id)
+        return self.trials[trial_id]
+
+    def _update_trial_state(self, event: RunEvent) -> None:
+        if not event.trial_id:
+            return
+        record = self._ensure_trial(event.trial_id)
+        if event.stage_name:
+            record["canonical_stage"] = event.stage_name
+        for key in (
+            "branch_name",
+            "parent_branch",
+            "parent_trial_id",
+            "acceptance_status",
+            "canonical_stage",
+            "canonical_score",
+            "primary_metric",
+        ):
+            if key in event.metadata and event.metadata.get(key) is not None:
+                record[key] = event.metadata.get(key)
+        if event.kind == "stage_completed":
+            if event.metadata.get("score") is not None:
+                record["canonical_score"] = event.metadata.get("score")
+            if event.metadata.get("primary_metric") is not None:
+                record["primary_metric"] = event.metadata.get("primary_metric")
+            if event.metadata.get("branch_name"):
+                record["branch_name"] = event.metadata.get("branch_name")
+        if event.kind == "trial_failed":
+            record["detail"] = str(event.metadata.get("detail") or "")
+        elif event.kind == "trial_completed":
+            record["detail"] = ""
+
+    def _rendered_line(self, event: RunEvent) -> str:
         scope = _scope_label(event)
         scope_prefix = f"[{scope}] " if scope else ""
-        rendered = f"{_short_ts(event.timestamp)} {_event_tag(event)} {scope_prefix}{event.message}"
+        return f"{_short_ts(event.timestamp)} {_event_tag(event)} {scope_prefix}{event.message}"
+
+    @staticmethod
+    def _is_usage_noise(line: str) -> bool:
+        stripped = line.strip()
+        if not stripped:
+            return True
+        if stripped.startswith(("│", "└", "{", "}", '"', "[", "]", ",")):
+            return True
+        if stripped.startswith(("Total usage est:", "API time spent:", "Total session time:", "Total code changes:")):
+            return True
+        if stripped.startswith("Breakdown by AI model:"):
+            return True
+        if re.match(r"^[A-Za-z0-9_.-]+\s+\d", stripped):
+            return True
+        return False
+
+    @staticmethod
+    def _normalize_agent_output(message: str) -> str | None:
+        stripped = message.strip()
+        if RichRunObserver._is_usage_noise(stripped):
+            return None
+        if stripped.startswith(("● ", "✗ ", "Reading ", "Applying ")):
+            return stripped
+        if any(token in stripped.lower() for token in ("retry", "error", "failed", "invalid")):
+            return stripped
+        return None
+
+    @staticmethod
+    def _normalize_terminal_output(message: str) -> str | None:
+        stripped = message.strip()
+        if not stripped:
+            return None
+        if re.fullmatch(r"\d+(?:\.\d+)?%", stripped):
+            return None
+        return stripped
+
+    def _append_activity(self, line: str) -> None:
+        self.activity_lines.append(line)
+
+    def _append_error(self, line: str) -> None:
+        self.error_lines.append(line)
+
+    def _record_process_output(self, *, event: RunEvent) -> None:
+        source = str(event.source or "")
+        rendered = self._rendered_line(event)
+        if source.startswith("stage.") or source.startswith("remote."):
+            normalized = self._normalize_terminal_output(event.message)
+            if normalized:
+                self._append_activity(f"{_short_ts(event.timestamp)} [term] {normalized}")
+            if source.endswith(".stderr") and normalized:
+                self._append_error(f"{_short_ts(event.timestamp)} [term] {normalized}")
+            return
+        if source.startswith("agent."):
+            normalized = self._normalize_agent_output(event.message)
+            if normalized:
+                target = self._append_error if any(token in normalized.lower() for token in ("error", "failed", "invalid")) else self._append_activity
+                target(f"{_short_ts(event.timestamp)} {_event_tag(event)} {normalized}")
+            return
+        self._append_activity(rendered)
+
+    def _record_event(self, event: RunEvent) -> None:
+        rendered = self._rendered_line(event)
         if event.kind == "process_output":
-            self._record_process_output(event=event, rendered=rendered)
-        elif event.kind in {
-            "process_waiting",
+            self._record_process_output(event=event)
+            return
+        if event.kind == "bo_tool_call":
+            self._append_activity(rendered)
+            return
+        if event.kind == "process_waiting":
+            self.transient_status = event.message
+            self.transient_pulse = (self.transient_pulse + 1) % 8
+            return
+        if event.kind in {
+            "planning_bundle_ready",
+            "execution_bundle_ready",
             "agent_prompt_sent",
             "agent_command_started",
             "agent_command_completed",
-            "planning_bundle_ready",
-            "execution_bundle_ready",
-        }:
-            self.agent_lines.append(rendered)
-        elif event.kind == "bo_tool_call":
-            self.bo_lines.append(rendered)
-        elif event.kind in {
-            "planning_completed",
             "planning_result",
-            "execution_completed",
             "execution_result",
             "descriptor_ready",
+            "stage_started",
             "stage_completed",
+            "trial_started",
             "trial_completed",
-            "trial_failed",
+            "baseline_started",
+            "baseline_completed",
         }:
-            self.summary_lines.append(rendered)
-            if event.kind in {"planning_result", "execution_result", "descriptor_ready"}:
-                self.bo_lines.append(rendered)
-            self.events.append(rendered)
-        else:
-            self.events.append(rendered)
-        if event.kind in {"trial_completed", "trial_failed"} and event.trial_id:
-            status = str(event.metadata.get("acceptance_status", "unknown"))
-            detail = str(event.metadata.get("detail", "") or "")
-            self.completed_trials.append((event.trial_id, status, detail))
-        self.live.update(self._render(), refresh=True)
+            self._append_activity(rendered)
+        if event.kind in {"trial_failed", "stage_failed", "run_stopped"}:
+            self._append_error(rendered)
+        detail = str(event.metadata.get("detail") or "").strip()
+        if detail:
+            self._append_error(f"{_short_ts(event.timestamp)} [detail] {detail}")
 
-    def _record_process_output(self, *, event: RunEvent, rendered: str) -> None:
-        source = str(event.source or "")
-        if source.startswith("stage.") or source.startswith("remote."):
-            self.terminal_lines.append(rendered)
-            return
-        if source.startswith("agent."):
-            self.agent_lines.append(rendered)
-            return
-        self.events.append(rendered)
+    def _lineage_depth(self, trial_id: str) -> int:
+        depth = 0
+        current = self.trials.get(trial_id, {})
+        seen: set[str] = set()
+        while True:
+            parent_trial_id = str(current.get("parent_trial_id") or "")
+            if not parent_trial_id:
+                status = str(current.get("acceptance_status") or "")
+                return depth if status == "baseline" else depth + 1
+            if parent_trial_id in seen:
+                return depth + 1
+            seen.add(parent_trial_id)
+            current = self.trials.get(parent_trial_id, {})
+            depth += 1
 
-    def _render(self):
-        banner_text = render_banner(
-            width=max(92, int(getattr(self.console.size, "width", 92) or 92)),
-            height=max(18, int(getattr(self.console.size, "height", 18) or 18)),
-            allow_unicode=True,
-        )
-        banner_panel = Panel(Text.from_ansi(banner_text), title="Bayesian Optimized Agents", expand=True)
+    def _best_trial(self) -> tuple[str, float] | None:
+        best: tuple[str, float] | None = None
+        for trial_id in self.trial_sequence:
+            record = self.trials.get(trial_id)
+            if record is None:
+                continue
+            metric = record.get("primary_metric")
+            if metric is None:
+                continue
+            metric_value = float(metric)
+            if best is None or metric_value > best[1]:
+                best = (trial_id, metric_value)
+        return best
 
+    def _render_header(self):
         header = Table.grid(expand=True)
         header.add_column(ratio=2)
         header.add_column(ratio=2)
+        current = self.trials.get(self.current_trial_id or "", {})
+        best = self._best_trial()
+        current_metric = current.get("primary_metric")
+        current_parent = str(current.get("parent_trial_id") or current.get("parent_branch") or "-")
         header.add_row(
             f"[bold]Trial[/bold]: {self.current_trial_id or '-'}",
             f"[bold]Phase[/bold]: {self.current_phase or '-'}",
@@ -182,66 +310,69 @@ class RichRunObserver(NullRunObserver, AbstractContextManager["RichRunObserver"]
             f"[bold]Stage[/bold]: {self.current_stage or '-'}",
             f"[bold]Status[/bold]: {self.current_status}",
         )
+        header.add_row(
+            f"[bold]Parent[/bold]: {current_parent or '-'}",
+            f"[bold]Accuracy[/bold]: {'-' if current_metric is None else f'{float(current_metric):.4%}'}",
+        )
+        header.add_row(
+            "[bold]Best[/bold]: " + ("-" if best is None else f"{best[0]} ({best[1]:.4%})"),
+            f"[bold]Branch[/bold]: {current.get('branch_name') or '-'}",
+        )
+        if self.transient_status:
+            filled = self.transient_pulse + 1
+            bar = "[" + ("=" * filled) + (" " * (8 - filled)) + "]"
+            header.add_row(
+                f"[bold]Activity[/bold]: {self.transient_status}",
+                f"[bold]Pulse[/bold]: {bar}",
+            )
+        return header
 
-        trial_table = Table(expand=True, box=None, show_header=True, header_style="bold")
-        trial_table.add_column("Trial", ratio=2)
-        trial_table.add_column("Status", ratio=2)
-        trial_table.add_column("Detail", ratio=5)
-        if self.completed_trials:
-            for trial_id, status, detail in self.completed_trials:
-                trial_table.add_row(trial_id, status, detail or "-")
-        else:
-            trial_table.add_row("-", "-", "No completed trials yet")
+    def _render_lineage(self):
+        lineage = Table(expand=True, box=None, show_header=True, header_style="bold")
+        lineage.add_column("Lineage", ratio=4)
+        lineage.add_column("Accuracy", ratio=2, justify="right")
+        lineage.add_column("Status", ratio=2)
+        for trial_id in self.trial_sequence:
+            record = self.trials.get(trial_id)
+            if record is None:
+                continue
+            depth = self._lineage_depth(trial_id)
+            prefix = "  " * max(0, depth - 1)
+            marker = "*" if trial_id == self.current_trial_id else " "
+            label = "accepted baseline" if str(record.get("acceptance_status")) == "baseline" else trial_id
+            lineage_label = f"{marker} {prefix}{'└─ ' if depth else ''}{label}"
+            metric = record.get("primary_metric")
+            lineage.add_row(
+                lineage_label,
+                "-" if metric is None else f"{float(metric):.4%}",
+                str(record.get("acceptance_status") or "-"),
+            )
+        if not self.trial_sequence:
+            lineage.add_row("No trials yet", "-", "-")
+        return lineage
 
-        event_table = Table(expand=True, box=None, show_header=False)
-        event_table.add_column(ratio=1)
-        if self.events:
-            for line in self.events:
-                event_table.add_row(line)
+    def _render(self):
+        activity_table = Table(expand=True, box=None, show_header=False)
+        activity_table.add_column(ratio=1)
+        if self.activity_lines:
+            for line in self.activity_lines:
+                activity_table.add_row(line)
         else:
-            event_table.add_row("Waiting for BOA events...")
+            activity_table.add_row("Waiting for activity...")
 
-        summary_table = Table(expand=True, box=None, show_header=False)
-        summary_table.add_column(ratio=1)
-        if self.summary_lines:
-            for line in self.summary_lines:
-                summary_table.add_row(line)
+        error_table = Table(expand=True, box=None, show_header=False)
+        error_table.add_column(ratio=1)
+        if self.error_lines:
+            for line in self.error_lines:
+                error_table.add_row(line)
         else:
-            summary_table.add_row("No structured results yet")
-
-        agent_table = Table(expand=True, box=None, show_header=False)
-        agent_table.add_column(ratio=1)
-        if self.agent_lines:
-            for line in self.agent_lines:
-                agent_table.add_row(line)
-        else:
-            agent_table.add_row("No agent dialog yet")
-
-        bo_table = Table(expand=True, box=None, show_header=False)
-        bo_table.add_column(ratio=1)
-        if self.bo_lines:
-            for line in self.bo_lines:
-                bo_table.add_row(line)
-        else:
-            bo_table.add_row("No Bayesian optimization output yet")
-
-        terminal_table = Table(expand=True, box=None, show_header=False)
-        terminal_table.add_column(ratio=1)
-        if self.terminal_lines:
-            for line in self.terminal_lines:
-                terminal_table.add_row(line)
-        else:
-            terminal_table.add_row("No stage terminal output yet")
+            error_table.add_row("No errors or warnings yet")
 
         return Group(
-            banner_panel,
-            Panel(header, title="BOA Run"),
-            Panel(trial_table, title="Recent Trials"),
-            Panel(summary_table, title="Prompt / Result Summary"),
-            Panel(bo_table, title="Bayesian Optimization"),
-            Panel(agent_table, title="Agent Dialog"),
-            Panel(terminal_table, title="Inner Terminal"),
-            Panel(event_table, title="Detailed Log"),
+            Panel(self._render_header(), title="BOA Run"),
+            Panel(self._render_lineage(), title="Lineage And Accuracy"),
+            Panel(activity_table, title="Activity"),
+            Panel(error_table, title="Errors"),
         )
 
 

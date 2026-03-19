@@ -490,6 +490,13 @@ class CliResearchAgent(BaseResearchAgent):
             message=" | ".join(summary_parts),
             trial_id=context.trial_id,
             phase="planning",
+            metadata={
+                "patch_category": plan.patch_category,
+                "operation_type": plan.operation_type,
+                "estimated_risk": plan.estimated_risk,
+                "parent_branch": plan.selected_parent_branch,
+                "parent_trial_id": plan.selected_parent_trial_id,
+            },
         )
         return plan
 
@@ -571,5 +578,11 @@ class CliResearchAgent(BaseResearchAgent):
             message=" | ".join(summary_parts),
             trial_id=context.trial_id,
             phase="execution",
+            metadata={
+                "patch_category": candidate.patch_category,
+                "operation_type": candidate.operation_type,
+                "estimated_risk": candidate.estimated_risk,
+                "numeric_knobs": dict(candidate.numeric_knobs),
+            },
         )
         return candidate

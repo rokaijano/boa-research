@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from boaresearch.agent_presets import ModelDiscoveryResult
-from boaresearch.init import InitWizard, PromptAdapter
+from boaresearch.init import InitWizard, PromptAdapter, build_config_from_plan
 from boaresearch.init.models import (
     DetectedRepo,
     ExistingSetupReport,
@@ -108,6 +108,7 @@ class InitAppTests(unittest.TestCase):
             analyze_repo=lambda detected_repo, setup: analysis,
             default_repo_analysis=lambda root: analysis,
             merge_reviewed_plan=lambda setup, proposal: plan,
+            build_config_from_plan=build_config_from_plan,
             write_contract_files=lambda reviewed: WriteResult(created_paths=[repo_root / "boa.config", repo_root / "boa.md"]),
             validate_written_setup=lambda reviewed: ValidationReport(passed=True, details=["Config parses successfully."]),
         )
@@ -117,14 +118,11 @@ class InitAppTests(unittest.TestCase):
         prompts = FakePrompts(
             [
                 "codex",
-                False,
-                "default",
                 "default",
                 "light",
                 "local",
                 "",
                 False,
-                True,
             ]
         )
         output: list[str] = []
@@ -172,7 +170,7 @@ class InitAppTests(unittest.TestCase):
 
     def test_codex_model_choices_are_listed(self) -> None:
         repo_root = Path(tempfile.mkdtemp())
-        prompts = PromptSpy([False, "default", "gpt-5-codex"])
+        prompts = PromptSpy(["gpt-5-codex"])
         wizard = InitWizard(
             initial_path=repo_root,
             services=self._services(repo_root),
@@ -198,7 +196,7 @@ class InitAppTests(unittest.TestCase):
 
     def test_codex_docs_fallback_choices_are_listed(self) -> None:
         repo_root = Path(tempfile.mkdtemp())
-        prompts = PromptSpy([False, "default", "gpt-5.4-mini"])
+        prompts = PromptSpy(["gpt-5.4-mini"])
         output: list[str] = []
         wizard = InitWizard(
             initial_path=repo_root,
@@ -232,7 +230,7 @@ class InitAppTests(unittest.TestCase):
 
     def test_claude_code_model_choices_are_listed(self) -> None:
         repo_root = Path(tempfile.mkdtemp())
-        prompts = PromptSpy([False, "default", "claude-sonnet-4-5"])
+        prompts = PromptSpy(["claude-sonnet-4-5"])
         wizard = InitWizard(
             initial_path=repo_root,
             services=self._services(repo_root),
@@ -258,7 +256,7 @@ class InitAppTests(unittest.TestCase):
 
     def test_copilot_model_selection_falls_back_to_manual_entry(self) -> None:
         repo_root = Path(tempfile.mkdtemp())
-        prompts = PromptSpy([False, "default", "custom", "gpt-5.4-mini"])
+        prompts = PromptSpy(["custom", "gpt-5.4-mini"])
         wizard = InitWizard(
             initial_path=repo_root,
             services=self._services(repo_root),
@@ -284,7 +282,7 @@ class InitAppTests(unittest.TestCase):
 
     def test_copilot_docs_fallback_choices_are_listed(self) -> None:
         repo_root = Path(tempfile.mkdtemp())
-        prompts = PromptSpy([False, "default", "gpt-5.4-mini"])
+        prompts = PromptSpy(["gpt-5.4-mini"])
         output: list[str] = []
         wizard = InitWizard(
             initial_path=repo_root,
@@ -343,7 +341,7 @@ class InitAppTests(unittest.TestCase):
 
     def test_unavailable_model_is_marked_and_reprompted(self) -> None:
         repo_root = Path(tempfile.mkdtemp())
-        prompts = PromptSpy([False, "default", "gpt-5.3-codex", "gpt-5.1-codex-max"])
+        prompts = PromptSpy(["gpt-5.3-codex", "gpt-5.1-codex-max"])
         output: list[str] = []
         wizard = InitWizard(
             initial_path=repo_root,
@@ -377,7 +375,7 @@ class InitAppTests(unittest.TestCase):
 
     def test_model_availability_status_is_shown_for_non_terminal_outputs(self) -> None:
         repo_root = Path(tempfile.mkdtemp())
-        prompts = PromptSpy([False, "default", "gpt-5.4-mini"])
+        prompts = PromptSpy(["gpt-5.4-mini"])
         output: list[str] = []
         wizard = InitWizard(
             initial_path=repo_root,

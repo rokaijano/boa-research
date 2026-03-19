@@ -7,3 +7,5 @@ data/
 artifacts/
 reports/
 .boa/
+boa.config
+boa.md

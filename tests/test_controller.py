@@ -50,6 +50,9 @@ class FakeWorktree:
     def validate_changed_paths(self, *, allowed_paths, protected_paths):
         return ["src/train.py"]
 
+    def cleanup_scratch_artifacts(self) -> list[str]:
+        return []
+
     def diff_text(self, *, base_ref: str) -> str:
         del base_ref
         return (

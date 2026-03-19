@@ -60,7 +60,8 @@ class AcceptanceEngine:
         if incumbent is None:
             improved = True
         else:
-            improved = adjusted_score >= (float(incumbent.adjusted_score) + self.config.objective.minimum_improvement_delta)
+            required_score = float(incumbent.adjusted_score) + self.config.objective.minimum_improvement_delta
+            improved = adjusted_score > required_score
         advanced = threshold_passed and improved
         final_accept = advanced and stage_name == self.highest_enabled_stage()
         reason_parts: list[str] = []

@@ -11,3 +11,5 @@ build/
 dist/
 
 tmp*/*
+examples/**/boa.config
+examples/**/boa.md
