@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import shlex
 import shutil
+import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
-from ..agent_presets import resolve_agent_profile
+from ..agent_presets import ModelDiscoveryResult, check_model_availability_for_agent, discover_available_models_for_agent, resolve_agent_profile
 from .banner import render_banner
 from .models import InitDraft, InitSetupSelection
 from .services import InitServices
@@ -39,9 +42,13 @@ class PromptAdapter:
 def build_prompt_adapter() -> PromptAdapter:
     from InquirerPy import inquirer
 
+    select_prompt = getattr(inquirer, "select")
+    text_prompt = getattr(inquirer, "text")
+    confirm_prompt = getattr(inquirer, "confirm")
+
     def select(*, message: str, choices: list[tuple[str, str]], default: str | None = None) -> str:
         return str(
-            inquirer.select(
+            select_prompt(
                 message=message,
                 choices=[{"name": label, "value": value} for label, value in choices],
                 default=default,
@@ -49,10 +56,10 @@ def build_prompt_adapter() -> PromptAdapter:
         )
 
     def text(*, message: str, default: str = "") -> str:
-        return str(inquirer.text(message=message, default=default).execute()).strip()
+        return str(text_prompt(message=message, default=default).execute()).strip()
 
     def confirm(*, message: str, default: bool = True) -> bool:
-        return bool(inquirer.confirm(message=message, default=default).execute())
+        return bool(confirm_prompt(message=message, default=default).execute())
 
     return PromptAdapter(select=select, text=text, confirm=confirm)
 
@@ -80,6 +87,54 @@ class InitWizard:
     def _show(self, message: str) -> None:
         self.output(message)
 
+    def _run_with_ephemeral_status(self, message: str, action: Callable[[], Any]) -> Any:
+        if self.output is not print:
+            self._show(message)
+            return action()
+
+        stop_event = threading.Event()
+        status_prefix = "\r\x1b[2K"
+        frames = ["■□□", "□■□", "□□■", "□■□"]
+
+        def render() -> None:
+            frame_index = 0
+            while not stop_event.wait(0.12):
+                frame = frames[frame_index % len(frames)]
+                sys.stdout.write(f"{status_prefix}{frame} {message}")
+                sys.stdout.flush()
+                frame_index += 1
+
+        worker = threading.Thread(target=render, daemon=True)
+        worker.start()
+        try:
+            time.sleep(0.02)
+            return action()
+        finally:
+            stop_event.set()
+            worker.join(timeout=0.5)
+            sys.stdout.write(f"{status_prefix}\r")
+            sys.stdout.flush()
+
+    def _show_validated_model(self, *, prompt_message: str, selected_model: str, default_label: str) -> None:
+        model_label = selected_model or default_label
+        rendered_line = f"? {prompt_message} {model_label} ✓"
+        if self.output is not print or not getattr(sys.stdout, "isatty", lambda: False)():
+            self._show(rendered_line)
+            return
+        sys.stdout.write(f"\x1b[1A\r\x1b[2K{rendered_line}\n")
+        sys.stdout.flush()
+
+    @staticmethod
+    def _agent_display_name(preset: str) -> str:
+        labels = {
+            "codex": "Codex",
+            "claude_code": "Claude Code",
+            "copilot": "Copilot",
+            "deepagents": "DeepAgents",
+            "custom": "custom agent",
+        }
+        return labels.get(str(preset or "").strip().lower(), "agent")
+
     def _agent_choices(self) -> list[tuple[str, str]]:
         choices: list[tuple[str, str]] = []
         for label, preset, binary in [
@@ -97,6 +152,122 @@ class InitWizard:
             choices.append((f"{label}{suffix}", preset))
         return choices
 
+    def _default_model_choice(self, *, current_model: str, choices: list[tuple[str, str]]) -> str:
+        values = {value for _, value in choices}
+        if current_model and current_model in values:
+            return current_model
+        if current_model:
+            return "custom"
+        return "default"
+
+    def _show_model_discovery(self, *, label: str, discovery: ModelDiscoveryResult) -> None:
+        if discovery.models:
+            source = f" via {discovery.source}" if discovery.source else ""
+            self._show(f"{label}: loaded {len(discovery.models)} model(s){source}.")
+            if discovery.warning:
+                self._show(f"{label}: {discovery.warning}")
+            return
+        if discovery.warning:
+            self._show(f"{label}: {discovery.warning}")
+            return
+        if discovery.supports_listing:
+            self._show(f"{label}: no models were discovered. You can still enter a model manually.")
+
+    @staticmethod
+    def _mark_unavailable_models(
+        choices: list[tuple[str, str]],
+        *,
+        unavailable_models: set[str],
+    ) -> list[tuple[str, str]]:
+        updated_choices: list[tuple[str, str]] = []
+        for label, value in choices:
+            if value in unavailable_models and value not in {"default", "custom"}:
+                updated_choices.append((f"{label} (not available)", value))
+            else:
+                updated_choices.append((label, value))
+        return updated_choices
+
+    @staticmethod
+    def _model_prompt_choices(discovery: ModelDiscoveryResult, *, default_label: str = "Use default model") -> list[tuple[str, str]]:
+        seen: set[str] = set()
+        deduped_models: list[tuple[str, str]] = []
+        for label, value in discovery.models:
+            if value in seen:
+                continue
+            seen.add(value)
+            deduped_models.append((label, value))
+        return [(default_label, "default"), *deduped_models, ("Custom model", "custom")]
+
+    def _prompt_for_model(
+        self,
+        *,
+        message: str,
+        current_model: str,
+        choices: list[tuple[str, str]],
+        custom_message: str,
+        custom_default: str = "",
+    ) -> str:
+        default_choice = self._default_model_choice(current_model=current_model, choices=choices)
+        model_choice = self.prompts.select(
+            message=message,
+            choices=choices,
+            default=default_choice,
+        )
+        if model_choice == "custom":
+            return self.prompts.text(message=custom_message, default=current_model or custom_default)
+        if model_choice == "default":
+            return ""
+        return model_choice
+
+    def _prompt_for_discovered_model(
+        self,
+        *,
+        label: str,
+        message: str,
+        current_model: str,
+        discovery: ModelDiscoveryResult,
+        custom_message: str,
+        custom_default: str = "",
+        default_label: str = "Use default model",
+        availability_kwargs: dict[str, Any] | None = None,
+    ) -> str:
+        self._show_model_discovery(label=label, discovery=discovery)
+        unavailable_models: set[str] = set()
+        base_choices = self._model_prompt_choices(discovery, default_label=default_label)
+        choice_values = {value for _, value in base_choices}
+        selected_model = current_model
+        validation_options = dict(availability_kwargs or {})
+        while True:
+            selected_model = self._prompt_for_model(
+                message=message,
+                current_model=selected_model,
+                choices=self._mark_unavailable_models(base_choices, unavailable_models=unavailable_models),
+                custom_message=custom_message,
+                custom_default=custom_default,
+            )
+            availability = self._run_with_ephemeral_status(
+                "Checking model availability",
+                lambda: check_model_availability_for_agent(
+                    model=selected_model,
+                    **validation_options,
+                ),
+            )
+            if availability.status != "unavailable":
+                if availability.status == "available":
+                    self._show_validated_model(
+                        prompt_message=message,
+                        selected_model=selected_model,
+                        default_label=default_label,
+                    )
+                if availability.status == "unknown" and availability.message:
+                    self._show(f"Model availability check: {availability.message}")
+                return selected_model
+            unavailable_models.add(selected_model)
+            if availability.message:
+                self._show(f"Model availability check: {availability.message}")
+            if selected_model in choice_values:
+                selected_model = ""
+
     def _configure_known_cli_agent(self, selection: InitSetupSelection, *, preset: str, default_command: str) -> None:
         selection.agent_command = default_command
         selection.agent_args = []
@@ -104,8 +275,14 @@ class InitWizard:
         selection.agent_profile = None
         selection.agent_model = ""
         command_missing = shutil.which(default_command) is None
-        if command_missing or self.prompts.confirm(message=f"Override `{default_command}` executable?", default=False):
-            selection.agent_command = self.prompts.text(message="Agent executable", default=default_command) or default_command
+        agent_name = self._agent_display_name(preset)
+        if command_missing or self.prompts.confirm(
+            message=f"Use a different {agent_name} command or path than `{default_command}`?",
+            default=False,
+        ):
+            selection.agent_command = (
+                self.prompts.text(message=f"{agent_name} command or path", default=default_command) or default_command
+            )
         if preset == "codex":
             profile_mode = self.prompts.select(
                 message="Codex profile",
@@ -115,22 +292,22 @@ class InitWizard:
             selection.agent_profile = (
                 self.prompts.text(message="Codex profile name", default=selection.agent_profile or "") or None
             ) if profile_mode == "profile" else None
-            model_mode = self.prompts.select(
-                message="Codex model",
-                choices=[
-                    ("Use default model", "default"),
-                    ("GPT-5.4", "gpt-5.4"),
-                    ("GPT-5 Codex", "gpt-5-codex"),
-                    ("Custom model", "custom"),
-                ],
-                default="default",
+            discovery = discover_available_models_for_agent(
+                preset=preset,
+                command=selection.agent_command,
             )
-            if model_mode == "custom":
-                selection.agent_model = self.prompts.text(message="Custom Codex model", default=selection.agent_model)
-            elif model_mode == "default":
-                selection.agent_model = ""
-            else:
-                selection.agent_model = model_mode
+            selection.agent_model = self._prompt_for_discovered_model(
+                label="Codex model discovery",
+                message="Codex model",
+                current_model=selection.agent_model,
+                discovery=discovery,
+                custom_message="Custom Codex model",
+                availability_kwargs={
+                    "preset": preset,
+                    "command": selection.agent_command,
+                    "api_key_env": "OPENAI_API_KEY",
+                },
+            )
             return
         profile_mode = self.prompts.select(
             message="CLI mode",
@@ -140,13 +317,18 @@ class InitWizard:
         selection.agent_profile = (
             self.prompts.text(message="Profile / mode", default=selection.agent_profile or "") or None
         ) if profile_mode == "custom" else None
-        model_mode = self.prompts.select(
+        discovery = discover_available_models_for_agent(preset=preset)
+        selection.agent_model = self._prompt_for_discovered_model(
+            label="Model discovery",
             message="Model",
-            choices=[("Use default model", "default"), ("Set custom model", "custom")],
-            default="default",
-        )
-        selection.agent_model = (
-            self.prompts.text(message="Custom model", default=selection.agent_model) if model_mode == "custom" else ""
+            current_model=selection.agent_model,
+            discovery=discovery,
+            custom_message="Custom model",
+            availability_kwargs={
+                "preset": preset,
+                "command": selection.agent_command,
+                "api_key_env": "ANTHROPIC_API_KEY" if preset == "claude_code" else None,
+            },
         )
 
     def _configure_deepagents(self, selection: InitSetupSelection) -> None:
@@ -159,20 +341,6 @@ class InitWizard:
             default=selection.agent_backend,
         )
         if selection.agent_backend == "ollama":
-            model_choice = self.prompts.select(
-                message="DeepAgents model",
-                choices=[
-                    ("Default model", "default"),
-                    ("qwen2.5-coder:14b", "qwen2.5-coder:14b"),
-                    ("Custom model", "custom"),
-                ],
-                default="default",
-            )
-            selection.agent_model = (
-                self.prompts.text(message="Custom Ollama model", default=selection.agent_model or "qwen2.5-coder:14b")
-                if model_choice == "custom"
-                else ("" if model_choice == "default" else model_choice)
-            )
             base_url_mode = self.prompts.select(
                 message="Ollama endpoint",
                 choices=[("Use default", "default"), ("Custom base URL", "custom")],
@@ -183,18 +351,27 @@ class InitWizard:
                 if base_url_mode == "custom"
                 else "http://127.0.0.1:11434"
             )
+            discovery = discover_available_models_for_agent(
+                preset="deepagents",
+                backend=selection.agent_backend,
+                base_url=selection.agent_base_url,
+            )
+            selection.agent_model = self._prompt_for_discovered_model(
+                label="DeepAgents model discovery",
+                message="DeepAgents model",
+                current_model=selection.agent_model,
+                discovery=discovery,
+                custom_message="Custom Ollama model",
+                custom_default="qwen2.5-coder:14b",
+                default_label="Default model",
+                availability_kwargs={
+                    "preset": "deepagents",
+                    "backend": selection.agent_backend,
+                    "base_url": selection.agent_base_url,
+                },
+            )
             selection.agent_api_key_env = None
             return
-        model_choice = self.prompts.select(
-            message="OpenAI model",
-            choices=[("Default model", "default"), ("gpt-5.4", "gpt-5.4"), ("Custom model", "custom")],
-            default="default",
-        )
-        selection.agent_model = (
-            self.prompts.text(message="Custom OpenAI model", default=selection.agent_model or "gpt-5.4")
-            if model_choice == "custom"
-            else ("" if model_choice == "default" else model_choice)
-        )
         key_choice = self.prompts.select(
             message="API key environment variable",
             choices=[("OPENAI_API_KEY", "OPENAI_API_KEY"), ("Custom env var", "custom")],
@@ -205,7 +382,37 @@ class InitWizard:
             if key_choice == "custom"
             else key_choice
         )
-        selection.agent_base_url = "https://api.openai.com/v1"
+        base_url_mode = self.prompts.select(
+            message="OpenAI-compatible endpoint",
+            choices=[("Use default", "default"), ("Custom base URL", "custom")],
+            default="default",
+        )
+        selection.agent_base_url = (
+            self.prompts.text(message="OpenAI-compatible base URL", default=selection.agent_base_url)
+            if base_url_mode == "custom"
+            else "https://api.openai.com/v1"
+        )
+        discovery = discover_available_models_for_agent(
+            preset="deepagents",
+            backend=selection.agent_backend,
+            api_key_env=selection.agent_api_key_env,
+            base_url=selection.agent_base_url,
+        )
+        selection.agent_model = self._prompt_for_discovered_model(
+            label="DeepAgents model discovery",
+            message="OpenAI model",
+            current_model=selection.agent_model,
+            discovery=discovery,
+            custom_message="Custom OpenAI model",
+            custom_default="gpt-5.4",
+            default_label="Default model",
+            availability_kwargs={
+                "preset": "deepagents",
+                "backend": selection.agent_backend,
+                "base_url": selection.agent_base_url,
+                "api_key_env": selection.agent_api_key_env,
+            },
+        )
 
     def _configure_custom_agent(self, selection: InitSetupSelection) -> None:
         selection.agent_command = self.prompts.text(message="Agent command", default=selection.agent_command or "")
@@ -345,9 +552,14 @@ class InitWizard:
     def _run_analysis(self) -> bool:
         assert self.draft.detected_repo is not None
         assert self.draft.selection is not None
+        detected_repo = self.draft.detected_repo
+        selection = self.draft.selection
         while True:
             try:
-                analysis = self.services.analyze_repo(self.draft.detected_repo, self.draft.selection)
+                analysis = self._run_with_ephemeral_status(
+                    "Analyzing repo",
+                    lambda: self.services.analyze_repo(detected_repo, selection),
+                )
                 self._show("\nRepo analysis completed.\n")
             except Exception as exc:
                 self._show(f"\nAnalysis failed: {exc}\n")

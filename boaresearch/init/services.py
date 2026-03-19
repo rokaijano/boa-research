@@ -84,6 +84,34 @@ def _shell_args(command: str) -> list[str]:
     return ["powershell", "-NoProfile", "-Command", command] if os.name == "nt" else ["bash", "-lc", command]
 
 
+def _normalize_command(command: str) -> str:
+    normalized = str(command or "").strip()
+    return normalized or "copilot"
+
+
+def _resolve_command_path(command: str) -> str:
+    executable = _normalize_command(command)
+    resolved = shutil.which(executable)
+    if resolved:
+        return resolved
+    return executable
+
+
+def _build_command_argv(command: str, args: list[str]) -> list[str]:
+    executable = _resolve_command_path(command)
+    if os.name == "nt" and executable.lower().endswith(".ps1"):
+        return [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            executable,
+            *args,
+        ]
+    return [executable, *args]
+
+
 def _preview_text(path: Path, *, limit: int = 1600) -> str:
     if not path.exists():
         return ""
@@ -184,7 +212,7 @@ def _is_sensitive_path(path: str) -> bool:
     if not normalized:
         return False
     value = normalized[0]
-    return value in {".boa", ".git"} or _looks_like_eval_path(value) or _looks_like_data_path(value)
+    return value in {".boa/protected", ".git"} or _looks_like_eval_path(value) or _looks_like_data_path(value)
 
 
 def _default_editable_paths(repo_root: Path) -> list[str]:
@@ -210,7 +238,7 @@ def _default_editable_paths(repo_root: Path) -> list[str]:
 
 
 def _default_protected_paths(repo_root: Path, *, metric_path: str | None) -> list[str]:
-    protected = [".boa", ".git"]
+    protected = [".boa/protected", ".git"]
     for candidate in ("eval.py", "evaluate.py", "evaluation.py", "src/eval.py", "src/evaluate.py", "src/evaluation.py"):
         if (repo_root / candidate).exists():
             protected.append(candidate)
@@ -649,20 +677,23 @@ def _run_cli_analysis(selection: InitSetupSelection, prompt: str, cwd: Path) -> 
         try:
             schema_file.write(json.dumps(REPO_ANALYSIS_SCHEMA, indent=2, sort_keys=True))
             schema_file.flush()
+            schema_file.close()
             output_file.close()
-            command = [
+            command = _build_command_argv(
                 base_command,
-                "exec",
-                prompt,
-                "--color",
-                "never",
-                "--output-schema",
-                schema_file.name,
-                "--output-last-message",
-                output_file.name,
-                "-C",
-                str(cwd),
-            ]
+                [
+                    "exec",
+                    "-",
+                    "--color",
+                    "never",
+                    "--output-schema",
+                    schema_file.name,
+                    "--output-last-message",
+                    output_file.name,
+                    "-C",
+                    str(cwd),
+                ],
+            )
             if agent.profile:
                 command.extend(["-p", str(agent.profile)])
             if agent.model:
@@ -670,6 +701,7 @@ def _run_cli_analysis(selection: InitSetupSelection, prompt: str, cwd: Path) -> 
             proc = subprocess.run(
                 command,
                 cwd=str(cwd),
+                input=prompt,
                 capture_output=True,
                 text=True,
                 check=False,
@@ -679,11 +711,17 @@ def _run_cli_analysis(selection: InitSetupSelection, prompt: str, cwd: Path) -> 
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "").strip()
                 raise ResearchAgentError(f"CLI analysis agent exited with code {proc.returncode}: {detail}")
-            return parse_repo_analysis(Path(output_file.name).read_text(encoding="utf-8"))
+            output_text = ""
+            output_path = Path(output_file.name)
+            if output_path.exists():
+                output_text = output_path.read_text(encoding="utf-8")
+            else:
+                output_text = (proc.stdout or proc.stderr or "").strip()
+            return parse_repo_analysis(output_text)
         finally:
             Path(schema_file.name).unlink(missing_ok=True)
             Path(output_file.name).unlink(missing_ok=True)
-    command = [base_command, *list(agent.args)]
+    command = _build_command_argv(base_command, list(agent.args))
     proc = subprocess.run(
         command,
         cwd=str(cwd),

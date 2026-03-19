@@ -161,11 +161,22 @@ def _build_config(raw: dict[str, Any], repo_root: Path, config_path: Path, boa_m
     cfg.agent.env = _normalize_str_map(cfg.agent.env, field_name="agent.env")
     cfg.agent.provider_options = dict(cfg.agent.provider_options or {})
     cfg.guardrails.allowed_paths = _normalize_path_prefixes(cfg.guardrails.allowed_paths)
-    cfg.guardrails.protected_paths = _normalize_path_prefixes(cfg.guardrails.protected_paths)
+    cfg.guardrails.protected_paths = _normalize_protected_path_prefixes(cfg.guardrails.protected_paths)
     cfg.guardrails.preflight_commands = _normalize_str_list(cfg.guardrails.preflight_commands)
     cfg.runner.local.env = _normalize_str_map(cfg.runner.local.env, field_name="runner.local.env")
     cfg.runner.ssh.env = _normalize_str_map(cfg.runner.ssh.env, field_name="runner.ssh.env")
     return cfg
+
+
+def _normalize_protected_path_prefixes(paths: list[str]) -> list[str]:
+    normalized = _normalize_path_prefixes(paths)
+    migrated: list[str] = []
+    for path in normalized:
+        if path == ".boa":
+            path = ".boa/protected"
+        if path not in migrated:
+            migrated.append(path)
+    return migrated
 
 
 def enabled_stages(cfg: BoaConfig) -> list[str]:
@@ -194,9 +205,9 @@ def validate_config(cfg: BoaConfig) -> BoaConfig:
     if cfg.run.accepted_branch is None:
         cfg.run.accepted_branch = f"boa/{tag}/accepted"
     if cfg.run.worktree_path is None:
-        cfg.run.worktree_path = (cfg.repo_root / ".boa" / "worktrees" / tag).resolve()
+        cfg.run.worktree_path = (cfg.repo_root / ".boa" / "worktree" / tag).resolve()
     if cfg.run.stop_file is None:
-        cfg.run.stop_file = (cfg.repo_root / ".boa" / "STOP").resolve()
+        cfg.run.stop_file = (cfg.repo_root / ".boa" / "protected" / "STOP").resolve()
 
     runtime = str(cfg.agent.runtime).strip().lower()
     if runtime not in {"cli", "deepagents"}:

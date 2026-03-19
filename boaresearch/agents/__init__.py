@@ -19,6 +19,7 @@ def build_agent(
             agent_config=config.agent,
             config=config,
             run_preflight=run_preflight,
+            observer=observer,
         )
     if runtime == "cli":
         from .cli import CliResearchAgent

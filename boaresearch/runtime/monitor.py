@@ -6,6 +6,7 @@ from contextlib import AbstractContextManager
 from datetime import datetime
 from typing import TextIO
 
+from ..init.banner import render_banner
 from .observer import NullRunObserver, RunEvent
 
 try:
@@ -13,10 +14,11 @@ try:
     from rich.live import Live
     from rich.panel import Panel
     from rich.table import Table
+    from rich.text import Text
 
     _RICH_AVAILABLE = True
 except ImportError:
-    Console = Group = Live = Panel = Table = None
+    Console = Group = Live = Panel = Table = Text = None
     _RICH_AVAILABLE = False
 
 
@@ -42,6 +44,10 @@ def _scope_label(event: RunEvent) -> str:
 
 def _event_tag(event: RunEvent) -> str:
     source = str(event.source or "")
+    if event.kind.startswith("bo_") or source.startswith("bo."):
+        return "[bo]"
+    if source.startswith("agent.") and event.phase == "execution":
+        return "[term]"
     if event.kind.startswith("agent_"):
         return "[agent]"
     if source.startswith("agent."):
@@ -80,6 +86,7 @@ class RichRunObserver(NullRunObserver, AbstractContextManager["RichRunObserver"]
         self.events: deque[str] = deque(maxlen=14)
         self.agent_lines: deque[str] = deque(maxlen=14)
         self.terminal_lines: deque[str] = deque(maxlen=18)
+        self.bo_lines: deque[str] = deque(maxlen=14)
         self.summary_lines: deque[str] = deque(maxlen=12)
         self.completed_trials: deque[tuple[str, str, str]] = deque(maxlen=8)
         self.current_trial_id: str | None = None
@@ -114,6 +121,7 @@ class RichRunObserver(NullRunObserver, AbstractContextManager["RichRunObserver"]
         if event.kind == "process_output":
             self._record_process_output(event=event, rendered=rendered)
         elif event.kind in {
+            "process_waiting",
             "agent_prompt_sent",
             "agent_command_started",
             "agent_command_completed",
@@ -121,6 +129,8 @@ class RichRunObserver(NullRunObserver, AbstractContextManager["RichRunObserver"]
             "execution_bundle_ready",
         }:
             self.agent_lines.append(rendered)
+        elif event.kind == "bo_tool_call":
+            self.bo_lines.append(rendered)
         elif event.kind in {
             "planning_completed",
             "planning_result",
@@ -132,6 +142,8 @@ class RichRunObserver(NullRunObserver, AbstractContextManager["RichRunObserver"]
             "trial_failed",
         }:
             self.summary_lines.append(rendered)
+            if event.kind in {"planning_result", "execution_result", "descriptor_ready"}:
+                self.bo_lines.append(rendered)
             self.events.append(rendered)
         else:
             self.events.append(rendered)
@@ -147,10 +159,18 @@ class RichRunObserver(NullRunObserver, AbstractContextManager["RichRunObserver"]
             self.terminal_lines.append(rendered)
             return
         if source.startswith("agent."):
+            self.agent_lines.append(rendered)
             return
         self.events.append(rendered)
 
     def _render(self):
+        banner_text = render_banner(
+            width=max(92, int(getattr(self.console.size, "width", 92) or 92)),
+            height=max(18, int(getattr(self.console.size, "height", 18) or 18)),
+            allow_unicode=True,
+        )
+        banner_panel = Panel(Text.from_ansi(banner_text), title="Bayesian Optimized Agents", expand=True)
+
         header = Table.grid(expand=True)
         header.add_column(ratio=2)
         header.add_column(ratio=2)
@@ -197,6 +217,14 @@ class RichRunObserver(NullRunObserver, AbstractContextManager["RichRunObserver"]
         else:
             agent_table.add_row("No agent dialog yet")
 
+        bo_table = Table(expand=True, box=None, show_header=False)
+        bo_table.add_column(ratio=1)
+        if self.bo_lines:
+            for line in self.bo_lines:
+                bo_table.add_row(line)
+        else:
+            bo_table.add_row("No Bayesian optimization output yet")
+
         terminal_table = Table(expand=True, box=None, show_header=False)
         terminal_table.add_column(ratio=1)
         if self.terminal_lines:
@@ -206,9 +234,11 @@ class RichRunObserver(NullRunObserver, AbstractContextManager["RichRunObserver"]
             terminal_table.add_row("No stage terminal output yet")
 
         return Group(
+            banner_panel,
             Panel(header, title="BOA Run"),
             Panel(trial_table, title="Recent Trials"),
             Panel(summary_table, title="Prompt / Result Summary"),
+            Panel(bo_table, title="Bayesian Optimization"),
             Panel(agent_table, title="Agent Dialog"),
             Panel(terminal_table, title="Inner Terminal"),
             Panel(event_table, title="Detailed Log"),

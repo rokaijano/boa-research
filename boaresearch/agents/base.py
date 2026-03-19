@@ -32,6 +32,7 @@ def extract_json_object(text: str) -> dict[str, Any]:
             lines.pop()
         candidate = "\n".join(lines).strip()
     decoder = json.JSONDecoder()
+    matches: list[tuple[int, dict[str, Any]]] = []
     for idx, char in enumerate(candidate):
         if char != "{":
             continue
@@ -40,7 +41,26 @@ def extract_json_object(text: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             continue
         if isinstance(obj, dict):
-            return obj
+            matches.append((idx, obj))
+    if matches:
+        preferred_keys = {
+            "hypothesis",
+            "rationale_summary",
+            "selected_parent_branch",
+            "patch_category",
+            "operation_type",
+            "estimated_risk",
+            "informed_by_call_ids",
+        }
+        _, best = max(
+            matches,
+            key=lambda item: (
+                sum(1 for key in preferred_keys if key in item[1]),
+                len(item[1]),
+                item[0],
+            ),
+        )
+        return best
     raise ResearchAgentError("Agent output did not contain a valid JSON object")
 
 

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from ..runtime.observer import RunEvent, RunObserver
 from ..schema import SearchToolCall
 
 
@@ -30,9 +31,36 @@ class SearchToolContext:
 
 
 class SearchTraceRecorder:
-    def __init__(self, *, trace_path: Path | None, phase: str) -> None:
+    def __init__(self, *, trace_path: Path | None, phase: str, observer: RunObserver | None = None) -> None:
         self.trace_path = trace_path
         self.phase = phase
+        self.observer = observer
+
+    @staticmethod
+    def _response_summary(tool_name: str, response: dict[str, Any]) -> str:
+        if tool_name == "recent_trials":
+            return f"{len(response.get('trials', []))} trials"
+        if tool_name == "list_lineage_options":
+            return f"{len(response.get('options', []))} lineage options"
+        if tool_name == "suggest_parents":
+            return f"{len(response.get('suggestions', []))} parent suggestions"
+        if tool_name == "score_candidate_descriptor":
+            acquisition = response.get("acquisition_score")
+            posterior_mean = response.get("posterior_mean")
+            posterior_std = response.get("posterior_std")
+            parts = []
+            if acquisition is not None:
+                parts.append(f"acq={float(acquisition):.3f}")
+            if posterior_mean is not None:
+                parts.append(f"mean={float(posterior_mean):.3f}")
+            if posterior_std is not None:
+                parts.append(f"std={float(posterior_std):.3f}")
+            return " ".join(parts) if parts else "descriptor scored"
+        if tool_name == "rank_patch_families":
+            return f"{len(response.get('families', []))} families"
+        if tool_name == "propose_numeric_knob_regions":
+            return f"{len(response.get('regions', []))} knob regions"
+        return "tool call recorded"
 
     def record(self, *, tool_name: str, request: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
         payload = dict(response)
@@ -49,6 +77,21 @@ class SearchTraceRecorder:
             )
             with self.trace_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(asdict(record), sort_keys=True) + "\n")
+        if self.observer is not None:
+            self.observer.emit(
+                RunEvent(
+                    kind="bo_tool_call",
+                    message=f"{tool_name}: {self._response_summary(tool_name, response)}",
+                    phase=self.phase,
+                    source=f"bo.{tool_name}",
+                    metadata={
+                        "call_id": payload["call_id"],
+                        "tool_name": tool_name,
+                        "request": request,
+                        "response": response,
+                    },
+                )
+            )
         return payload
 
 

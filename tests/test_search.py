@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -78,6 +77,21 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(options[0]["branch_name"], "boa/demo/accepted")
         self.assertEqual(options[1]["trial_id"], "t1")
 
+    def test_validate_parent_selection_accepts_accepted_branch_with_nonempty_trial_id(self) -> None:
+        oracle = SearchOracleService(
+            config=build_config(),
+            memory=[build_trial("t1", 0.2, "optimizer")],
+            accepted_branch="boa/demo/accepted",
+        )
+        lineage = oracle.validate_parent_selection(
+            branch_name="boa/demo/accepted",
+            trial_id="t1",
+        )
+        self.assertIsNotNone(lineage)
+        assert lineage is not None
+        self.assertEqual(lineage["branch_name"], "boa/demo/accepted")
+        self.assertIsNone(lineage["trial_id"])
+
     def test_suggest_parents_prefers_request_aligned_parent(self) -> None:
         oracle = SearchOracleService(
             config=build_config(),
@@ -128,7 +142,8 @@ class SearchTests(unittest.TestCase):
         self.assertGreater(regions[0]["count"], 1)
 
     def test_toolbox_emits_call_ids(self) -> None:
-        trace_path = Path(tempfile.mkdtemp()) / "search_calls.jsonl"
+        trace_path = Path.cwd() / "_tmp_search_calls.jsonl"
+        self.addCleanup(lambda: trace_path.unlink(missing_ok=True))
         toolbox = SearchToolbox(
             oracle=SearchOracleService(
                 config=build_config(),
@@ -140,6 +155,29 @@ class SearchTests(unittest.TestCase):
         response = toolbox.list_lineage_options({"limit": 3})
         self.assertIn("call_id", response)
         self.assertTrue(trace_path.exists())
+
+    def test_search_trace_recorder_can_emit_observer_events(self) -> None:
+        class RecordingObserver:
+            def __init__(self) -> None:
+                self.events = []
+
+            def emit(self, event) -> None:
+                self.events.append(event)
+
+        observer = RecordingObserver()
+        toolbox = SearchToolbox(
+            oracle=SearchOracleService(
+                config=build_config(),
+                memory=[build_trial("t1", 0.5, "optimizer")],
+                accepted_branch="boa/demo/accepted",
+            ),
+            recorder=SearchTraceRecorder(trace_path=None, phase="planning", observer=observer),
+        )
+
+        toolbox.recent_trials({"limit": 2})
+
+        self.assertTrue(any(event.kind == "bo_tool_call" for event in observer.events))
+        self.assertTrue(any(event.source == "bo.recent_trials" for event in observer.events))
 
 
 if __name__ == "__main__":

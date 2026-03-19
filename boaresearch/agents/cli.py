@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import subprocess
 from pathlib import Path
@@ -9,7 +10,8 @@ from ..process import run_process_with_live_output
 from ..prompt_builder import build_cli_execution_bundle, build_cli_planning_bundle
 from ..runtime.observer import RunEvent
 from ..schema import AgentExecutionContext, AgentPlanningContext, CandidateMetadata, CandidatePlan
-from .base import BaseResearchAgent, ResearchAgentError, extract_json_object, parse_candidate_dict, parse_candidate_plan_dict
+from .base import BaseResearchAgent, ResearchAgentError
+from .interaction import BoaInteractionLayer
 
 
 class CliResearchAgent(BaseResearchAgent):
@@ -17,6 +19,7 @@ class CliResearchAgent(BaseResearchAgent):
         self.repo_root = repo_root
         self.agent_config = agent_config
         self.observer = observer
+        self.interaction = BoaInteractionLayer()
 
     def _emit(
         self,
@@ -80,6 +83,57 @@ class CliResearchAgent(BaseResearchAgent):
         args = [self._render_template(arg, values) for arg in list(self.agent_config.args)]
         return [command, *args]
 
+    def _append_model_arg_if_supported(self, command: list[str]) -> list[str]:
+        model_name = str(self.agent_config.model or "").strip()
+        if not model_name:
+            return command
+        existing = [str(arg).strip().lower() for arg in command[1:]]
+        if "-m" in existing or "--model" in existing:
+            return command
+        preset = str(self.agent_config.preset or "").strip().lower()
+        if preset == "copilot":
+            return [*command, "--model", model_name]
+        if preset in {"codex", "claude_code"}:
+            return [*command, "-m", model_name]
+        return command
+
+    def _append_noninteractive_flags_if_supported(self, command: list[str]) -> list[str]:
+        preset = str(self.agent_config.preset or "").strip().lower()
+        if preset != "copilot":
+            return command
+        existing = {str(arg).strip().lower() for arg in command[1:]}
+        updated = list(command)
+        if "--allow-all-tools" not in existing:
+            updated.append("--allow-all-tools")
+        return updated
+
+    @staticmethod
+    def _resolve_command_path(command: str) -> str:
+        executable = str(command or "").strip()
+        if not executable:
+            return executable
+        resolved = shutil.which(executable)
+        if resolved:
+            return resolved
+        return executable
+
+    @classmethod
+    def _resolve_command_argv(cls, command: list[str]) -> list[str]:
+        if not command:
+            return command
+        executable = cls._resolve_command_path(command[0])
+        if os.name == "nt" and executable.lower().endswith(".ps1"):
+            return [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                executable,
+                *command[1:],
+            ]
+        return [executable, *command[1:]]
+
     def _is_codex_exec_adapter(self, values: dict[str, str]) -> bool:
         if str(self.agent_config.preset).strip().lower() != "codex":
             return False
@@ -106,6 +160,7 @@ class CliResearchAgent(BaseResearchAgent):
             "prompt": bundle_root / "combined_prompt.txt",
             "plan_schema": bundle_root / "plan_schema.json",
             "plan_example": bundle_root / "plan_example.json",
+            "last_message": bundle_root / "last_message.txt",
             "tool_launcher": tool_command,
             "stdout": bundle_root / "last_stdout.txt",
             "stderr": bundle_root / "last_stderr.txt",
@@ -117,6 +172,8 @@ class CliResearchAgent(BaseResearchAgent):
         paths["plan_example"].write_text(bundle["plan_example"], encoding="utf-8")
         if context.plan_output_path.exists():
             context.plan_output_path.unlink()
+        if paths["last_message"].exists():
+            paths["last_message"].unlink()
         return paths
 
     def _write_execution_bundle(self, context: AgentExecutionContext) -> dict[str, Path]:
@@ -130,6 +187,7 @@ class CliResearchAgent(BaseResearchAgent):
             "prompt": bundle_root / "combined_prompt.txt",
             "candidate_schema": bundle_root / "candidate_schema.json",
             "candidate_example": bundle_root / "candidate_example.json",
+            "last_message": bundle_root / "last_message.txt",
             "tool_launcher": tool_command,
             "stdout": bundle_root / "last_stdout.txt",
             "stderr": bundle_root / "last_stderr.txt",
@@ -141,28 +199,46 @@ class CliResearchAgent(BaseResearchAgent):
         paths["candidate_example"].write_text(bundle["candidate_example"], encoding="utf-8")
         if context.candidate_output_path.exists():
             context.candidate_output_path.unlink()
+        if paths["last_message"].exists():
+            paths["last_message"].unlink()
         return paths
 
     def _write_tool_launcher(self, *, bundle_root: Path, tool_context_path: Path) -> Path:
-        launcher_path = bundle_root / "boa-tools"
+        launcher_name = "boa-tools.cmd" if os.name == "nt" else "boa-tools"
+        launcher_path = bundle_root / launcher_name
         pythonpath_entries = [str(self.repo_root)]
         existing_pythonpath = os.environ.get("PYTHONPATH")
         if existing_pythonpath:
             pythonpath_entries.append(existing_pythonpath)
-        launcher_path.write_text(
-            "\n".join(
-                [
-                    "#!/bin/sh",
-                    "set -eu",
-                    f'export BOA_TOOL_CONTEXT_PATH="{tool_context_path}"',
-                    f'export PYTHONPATH="{":".join(pythonpath_entries)}"',
-                    f'exec "{sys.executable}" -m boaresearch.cli "$@"',
-                    "",
-                ]
-            ),
-            encoding="utf-8",
-        )
-        launcher_path.chmod(0o755)
+        if os.name == "nt":
+            launcher_path.write_text(
+                "\r\n".join(
+                    [
+                        "@echo off",
+                        "setlocal",
+                        f'set "BOA_TOOL_CONTEXT_PATH={tool_context_path}"',
+                        f'set "PYTHONPATH={";".join(pythonpath_entries)}"',
+                        f'"{sys.executable}" -m boaresearch.cli %*',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+        else:
+            launcher_path.write_text(
+                "\n".join(
+                    [
+                        "#!/bin/sh",
+                        "set -eu",
+                        f'export BOA_TOOL_CONTEXT_PATH="{tool_context_path}"',
+                        f'export PYTHONPATH="{":".join(pythonpath_entries)}"',
+                        f'exec "{sys.executable}" -m boaresearch.cli "$@"',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            launcher_path.chmod(0o755)
         return launcher_path
 
     def _run_cli(
@@ -177,7 +253,11 @@ class CliResearchAgent(BaseResearchAgent):
         stdout_path: Path,
         stderr_path: Path,
     ) -> str:
-        command = self._build_command(template_values)
+        command = self._resolve_command_argv(
+            self._append_noninteractive_flags_if_supported(
+                self._append_model_arg_if_supported(self._build_command(template_values))
+            )
+        )
         env = os.environ.copy()
         env.update({key: self._render_template(value, template_values) for key, value in dict(self.agent_config.env).items()})
         env.update(extra_env)
@@ -236,14 +316,6 @@ class CliResearchAgent(BaseResearchAgent):
             phase=phase,
             metadata={"returncode": proc.returncode},
         )
-        if proc.returncode != 0:
-            stdout_tail = self._tail(proc.stdout)
-            stderr_tail = self._tail(proc.stderr)
-            raise ResearchAgentError(
-                f"CLI agent '{self.agent_config.preset}' exited with code {proc.returncode} during {phase}.\n"
-                f"stdout:\n{stdout_tail or '<empty>'}\n\n"
-                f"stderr:\n{stderr_tail or '<empty>'}"
-            )
         return proc.stdout or ""
 
     def _run_codex_exec(
@@ -253,25 +325,27 @@ class CliResearchAgent(BaseResearchAgent):
         phase: str,
         cwd: Path,
         prompt_path: Path,
-        output_path: Path,
+        last_message_path: Path,
         template_values: dict[str, str],
         extra_env: dict[str, str],
         stdout_path: Path,
         stderr_path: Path,
     ) -> str:
-        command = [
-            self._render_template(str(self.agent_config.command), template_values),
-            "exec",
-            "-",
-            "--color",
-            "never",
-            "--sandbox",
-            "workspace-write",
-            "--output-last-message",
-            str(output_path),
-            "-C",
-            str(cwd),
-        ]
+        command = self._resolve_command_argv(
+            [
+                self._render_template(str(self.agent_config.command), template_values),
+                "exec",
+                "-",
+                "--color",
+                "never",
+                "--sandbox",
+                "workspace-write",
+                "--output-last-message",
+                str(last_message_path),
+                "-C",
+                str(cwd),
+            ]
+        )
         if self.agent_config.profile:
             command.extend(["-p", str(self.agent_config.profile)])
         if self.agent_config.model:
@@ -327,6 +401,9 @@ class CliResearchAgent(BaseResearchAgent):
             ) from exc
         stdout_path.write_text(proc.stdout or "", encoding="utf-8")
         stderr_path.write_text(proc.stderr or "", encoding="utf-8")
+        last_message = ""
+        if last_message_path.exists():
+            last_message = last_message_path.read_text(encoding="utf-8")
         self._emit(
             kind="agent_command_completed",
             message=f"{self.agent_config.preset} {phase} finished with exit code {proc.returncode}",
@@ -334,29 +411,7 @@ class CliResearchAgent(BaseResearchAgent):
             phase=phase,
             metadata={"returncode": proc.returncode},
         )
-        if proc.returncode != 0:
-            stdout_tail = self._tail(proc.stdout)
-            stderr_tail = self._tail(proc.stderr)
-            raise ResearchAgentError(
-                f"CLI agent '{self.agent_config.preset}' exited with code {proc.returncode} during {phase}.\n"
-                f"stdout:\n{stdout_tail or '<empty>'}\n\n"
-                f"stderr:\n{stderr_tail or '<empty>'}"
-            )
-        return proc.stdout or ""
-
-    def _parse_plan(self, *, plan_path: Path, stdout: str) -> CandidatePlan:
-        if plan_path.exists():
-            data = extract_json_object(plan_path.read_text(encoding="utf-8"))
-            return parse_candidate_plan_dict(data)
-        data = extract_json_object(stdout)
-        return parse_candidate_plan_dict(data)
-
-    def _parse_candidate(self, *, candidate_path: Path, stdout: str) -> CandidateMetadata:
-        if candidate_path.exists():
-            data = extract_json_object(candidate_path.read_text(encoding="utf-8"))
-            return parse_candidate_dict(data)
-        data = extract_json_object(stdout)
-        return parse_candidate_dict(data)
+        return last_message or proc.stdout or ""
 
     def plan_trial(self, context: AgentPlanningContext) -> CandidatePlan:
         bundle_paths = self._write_planning_bundle(context)
@@ -398,7 +453,7 @@ class CliResearchAgent(BaseResearchAgent):
                 phase="planning",
                 cwd=context.worktree_path,
                 prompt_path=bundle_paths["prompt"],
-                output_path=context.plan_output_path,
+                last_message_path=bundle_paths["last_message"],
                 template_values=template_values,
                 extra_env=env,
                 stdout_path=bundle_paths["stdout"],
@@ -416,12 +471,13 @@ class CliResearchAgent(BaseResearchAgent):
                 stderr_path=bundle_paths["stderr"],
             )
         try:
-            plan = self._parse_plan(plan_path=context.plan_output_path, stdout=stdout)
+            plan = self.interaction.parse_plan_output(plan_path=context.plan_output_path, stdout=stdout)
         except ResearchAgentError as exc:
             raise ResearchAgentError(
                 f"CLI agent '{self.agent_config.preset}' did not return a valid candidate plan.\n"
                 f"stdout:\n{self._tail(stdout) or '<empty>'}"
             ) from exc
+        self.interaction.persist_plan(plan_path=context.plan_output_path, plan=plan)
         summary_parts = [
             f"Plan ready: {plan.patch_category}/{plan.operation_type}",
             f"parent={plan.selected_parent_branch}",
@@ -478,7 +534,7 @@ class CliResearchAgent(BaseResearchAgent):
                 phase="execution",
                 cwd=context.worktree_path,
                 prompt_path=bundle_paths["prompt"],
-                output_path=context.candidate_output_path,
+                last_message_path=bundle_paths["last_message"],
                 template_values=template_values,
                 extra_env=env,
                 stdout_path=bundle_paths["stdout"],
@@ -496,12 +552,13 @@ class CliResearchAgent(BaseResearchAgent):
                 stderr_path=bundle_paths["stderr"],
             )
         try:
-            candidate = self._parse_candidate(candidate_path=context.candidate_output_path, stdout=stdout)
+            candidate = self.interaction.parse_candidate_output(candidate_path=context.candidate_output_path, stdout=stdout)
         except ResearchAgentError as exc:
             raise ResearchAgentError(
                 f"CLI agent '{self.agent_config.preset}' did not return valid candidate metadata.\n"
                 f"stdout:\n{self._tail(stdout) or '<empty>'}"
             ) from exc
+        self.interaction.persist_candidate(candidate_path=context.candidate_output_path, candidate=candidate)
         summary_parts = [
             f"Candidate ready: {candidate.patch_category}/{candidate.operation_type}",
             f"risk={candidate.estimated_risk:.2f}",

@@ -9,7 +9,7 @@ This repository packages BOA (Bayesian Optimized Agents) as a reusable Python to
 - The coding agent is the search strategist. It may choose hypotheses and select a parent lineage from BOA-provided lineage options.
 - The BO layer is decision support. It provides acquisition-style guidance, lineage ranking, family ranking, and numeric knob suggestions, but it does not author diffs directly.
 - Target repositories are the runtime boundary. `boa init` converts an existing Git repository into a BOA-ready repository.
-- BOA persists runtime state inside the target repo under `.boa/`.
+- BOA persists core runtime state inside the target repo under `.boa/` and uses a BOA-managed trial worktree path for editable trial checkouts.
 - BOA is the source of truth for:
   - initialization and contract-file generation
   - branch creation
@@ -44,20 +44,20 @@ This repository packages BOA (Bayesian Optimized Agents) as a reusable Python to
   - accepted branch: `boa/<run_tag>/accepted`
   - trial branch: `boa/<run_tag>/trial/<trial_id>`
 - BOA promotes only the managed accepted branch. It must not write directly to the user’s main branch.
-- BOA-owned runtime state lives under `.boa/`. Agents and adapters must not create parallel hidden state elsewhere in the target repo.
+- BOA-owned runtime state lives under `.boa/`, with editable trial checkouts under `.boa/worktree/` and BOA-protected state under `.boa/protected/`. Agents and adapters must not create parallel hidden state elsewhere in the target repo.
 - Only the current BOA schema is supported. Do not add compatibility code for superseded config shapes.
 
-## Runtime Layout Under `.boa/`
+## Runtime Layout
 
 The current code uses these BOA-owned paths:
 
-- `.boa/artifacts/trials/<trial_id>/`
-- `.boa/agent_outputs/<trial_id>/`
-- `.boa/agent_traces/<trial_id>/search_calls.jsonl`
-- `.boa/prompts/<trial_id>/`
-- `.boa/store/experiments.sqlite`
-- `.boa/worktrees/<run_tag>/`
-- `.boa/STOP`
+- `.boa/worktree/<run_tag>/`
+- `.boa/protected/artifacts/trials/<trial_id>/`
+- `.boa/protected/agent_outputs/<trial_id>/`
+- `.boa/protected/agent_traces/<trial_id>/search_calls.jsonl`
+- `.boa/protected/prompts/<trial_id>/`
+- `.boa/protected/store/experiments.sqlite`
+- `.boa/protected/STOP`
 
 If this layout changes materially, update this file in the same change.
 

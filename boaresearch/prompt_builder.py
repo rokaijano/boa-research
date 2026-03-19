@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -124,12 +126,57 @@ def _supplemental_sections(*, repo_root: Path, extra_context_files: list[Path]) 
     return "\n\n".join(sections) if sections else "<no supplemental repo instructions>"
 
 
+def _bootstrap_tool_sections(calls: list[Any]) -> str:
+    if not calls:
+        return "<no bootstrap BOA tool results provided>"
+    sections: list[str] = []
+    for call in calls:
+        sections.append(
+            "\n".join(
+                [
+                    f"Call id: {call.call_id}",
+                    f"Tool: {call.tool_name}",
+                    f"Request: {json.dumps(call.request, sort_keys=True)}",
+                    f"Response: {json.dumps(call.response, indent=2, sort_keys=True)}",
+                ]
+            )
+        )
+    return "\n\n".join(sections)
+
+
+def _tool_command_display() -> str:
+    return f'"{sys.executable}" -m boaresearch.cli'
+
+
+def _tool_shell_examples(tool_command: str) -> dict[str, str]:
+    if os.name == "nt":
+        return {
+            "tool_recent_trials_example": f"echo '{{}}' | {tool_command} tools recent-trials",
+            "tool_list_lineage_options_example": f"echo '{{}}' | {tool_command} tools list-lineage-options",
+            "tool_suggest_parents_example": (
+                f"echo '{{\"patch_category\":\"optimizer\",\"operation_type\":\"replace\",\"estimated_risk\":0.25}}' | "
+                f"{tool_command} tools suggest-parents"
+            ),
+        }
+    return {
+        "tool_recent_trials_example": f"printf '{{}}' | {tool_command} tools recent-trials",
+        "tool_list_lineage_options_example": f"printf '{{}}' | {tool_command} tools list-lineage-options",
+        "tool_suggest_parents_example": (
+            f"printf '{{\"patch_category\":\"optimizer\",\"operation_type\":\"replace\",\"estimated_risk\":0.25}}' | "
+            f"{tool_command} tools suggest-parents"
+        ),
+    }
+
+
 def build_planning_system_prompt(
     *,
     repo_root: Path,
     context: AgentPlanningContext,
     tool_command: str = "boa",
 ) -> str:
+    del tool_command
+    prompt_tool_command = _tool_command_display()
+    tool_examples = _tool_shell_examples(prompt_tool_command)
     return render_prompt_template(
         "agent",
         "planning_system.md",
@@ -139,8 +186,9 @@ def build_planning_system_prompt(
         boa_md_display_path=_display_path(context.boa_md_path, repo_root),
         boa_md_text=_read_text(context.boa_md_path, limit=None),
         supplemental_sections=_supplemental_sections(repo_root=repo_root, extra_context_files=context.extra_context_files),
-        tool_command=tool_command,
-        tool_command_quoted=shlex.quote(tool_command),
+        tool_command=prompt_tool_command,
+        tool_command_quoted=prompt_tool_command,
+        **tool_examples,
     )
 
 
@@ -150,6 +198,9 @@ def build_execution_system_prompt(
     context: AgentExecutionContext,
     tool_command: str = "boa",
 ) -> str:
+    del tool_command
+    prompt_tool_command = _tool_command_display()
+    tool_examples = _tool_shell_examples(prompt_tool_command)
     return render_prompt_template(
         "agent",
         "execution_system.md",
@@ -161,8 +212,9 @@ def build_execution_system_prompt(
         supplemental_sections=_supplemental_sections(repo_root=repo_root, extra_context_files=context.extra_context_files),
         parent_branch=context.parent_branch,
         trial_branch=context.trial_branch,
-        tool_command=tool_command,
-        tool_command_quoted=shlex.quote(tool_command),
+        tool_command=prompt_tool_command,
+        tool_command_quoted=prompt_tool_command,
+        **tool_examples,
     )
 
 
@@ -188,6 +240,7 @@ def build_planning_task(context: AgentPlanningContext) -> str:
         objective_summary=context.objective_summary,
         plan_output_path=str(context.plan_output_path),
         recent_trials="\n".join(recent_lines) if recent_lines else "<no prior trials recorded>",
+        bootstrap_tool_calls=_bootstrap_tool_sections(context.bootstrap_tool_calls),
     )
 
 
@@ -217,6 +270,7 @@ def build_execution_task(context: AgentExecutionContext) -> str:
         candidate_output_path=str(context.candidate_output_path),
         candidate_plan_json=json.dumps(context.candidate_plan.__dict__, indent=2, sort_keys=True),
         recent_trials="\n".join(recent_lines) if recent_lines else "<no prior trials recorded>",
+        bootstrap_tool_calls=_bootstrap_tool_sections(context.bootstrap_tool_calls),
         preflight_commands="\n".join(context.preflight_commands) if context.preflight_commands else "<none>",
     )
 

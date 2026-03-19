@@ -4,7 +4,8 @@ import json
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from .base import ResearchAgentError, parse_candidate_dict, parse_candidate_plan_dict
+from .base import ResearchAgentError
+from .interaction import BoaInteractionLayer
 from ..schema import CandidateMetadata, CandidatePlan
 from ..search import SearchToolbox
 
@@ -12,6 +13,7 @@ from ..search import SearchToolbox
 @dataclass
 class CandidatePlanSubmissionRecorder:
     plan: Optional[CandidatePlan] = None
+    interaction: BoaInteractionLayer = BoaInteractionLayer()
 
     def submit(
         self,
@@ -28,7 +30,7 @@ class CandidatePlanSubmissionRecorder:
         notes: Optional[str] = None,
         informed_by_call_ids: Optional[list[str]] = None,
     ) -> None:
-        self.plan = parse_candidate_plan_dict(
+        self.plan = self.interaction.parse_plan_payload(
             {
                 "hypothesis": hypothesis,
                 "rationale_summary": rationale_summary,
@@ -48,6 +50,7 @@ class CandidatePlanSubmissionRecorder:
 @dataclass
 class CandidateSubmissionRecorder:
     candidate: Optional[CandidateMetadata] = None
+    interaction: BoaInteractionLayer = BoaInteractionLayer()
 
     def submit(
         self,
@@ -62,7 +65,7 @@ class CandidateSubmissionRecorder:
         notes: Optional[str] = None,
         informed_by_call_ids: Optional[list[str]] = None,
     ) -> None:
-        self.candidate = parse_candidate_dict(
+        self.candidate = self.interaction.parse_candidate_payload(
             {
                 "hypothesis": hypothesis,
                 "rationale_summary": rationale_summary,

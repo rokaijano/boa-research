@@ -26,7 +26,7 @@ from ..schema import (
     StageRunResult,
     TrialSummary,
 )
-from ..search import SearchOracleService, SearchToolContext, load_search_trace, write_search_tool_context
+from ..search import SearchOracleService, SearchToolContext, SearchToolbox, SearchTraceRecorder, load_search_trace, write_search_tool_context
 from .store import ExperimentStore
 from .worktree import WorktreeError, WorktreeManager
 
@@ -55,14 +55,14 @@ class BoaController:
         self.config = config
         self.observer = observer or NullRunObserver()
         self.paths = BoaPaths.from_config(config)
-        helper_root = self.paths.runtime_root / "git_auth_helpers"
+        helper_root = self.paths.protected_root / "git_auth_helpers"
         self.git_auth = GitAuthManager(config.git_auth, helper_root=helper_root)
         self.store = ExperimentStore(self.paths.store_path)
         self.acceptance = AcceptanceEngine(config)
         self.runner = build_trial_runner(config, git_auth=self.git_auth, observer=self.observer)
         self.worktree = WorktreeManager(
             repo_root=config.repo_root,
-            worktree_path=config.run.worktree_path or (config.repo_root / ".boa" / "worktrees" / config.run.tag),
+            worktree_path=config.run.worktree_path or self.paths.worktree_dir(config.run.tag),
             accepted_branch=str(config.run.accepted_branch),
             git_auth=self.git_auth,
         )
@@ -159,12 +159,12 @@ class BoaController:
         return path
 
     def _search_trace_path(self, trial_id: str) -> Path:
-        path = self.worktree.worktree_path / ".boa" / "agent_traces" / trial_id / "search_calls.jsonl"
+        path = self.paths.search_trace_path(trial_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
     def _agent_output_dir(self, trial_id: str) -> Path:
-        path = self.worktree.worktree_path / ".boa" / "agent_outputs" / trial_id
+        path = self.paths.agent_output_dir(trial_id)
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -222,6 +222,7 @@ class BoaController:
         self.worktree.prepare_trial(trial_branch=accepted_branch, parent_branch=accepted_branch)
 
     def _build_planning_context(self, *, trial_id: str, recent_trials: list[TrialSummary]) -> AgentPlanningContext:
+        bootstrap_tool_calls = self._record_planning_bootstrap_calls(trial_id=trial_id, recent_trials=recent_trials)
         return AgentPlanningContext(
             repo_root=self.config.repo_root,
             worktree_path=self.worktree.worktree_path,
@@ -233,6 +234,7 @@ class BoaController:
             allowed_paths=list(self.config.guardrails.allowed_paths),
             protected_paths=list(self.config.guardrails.protected_paths),
             recent_trials=recent_trials,
+            bootstrap_tool_calls=bootstrap_tool_calls,
             objective_summary=self._objective_summary(),
             max_agent_steps=int(self.config.agent.max_agent_steps),
             prompt_bundle_dir=self._prompt_bundle_dir(trial_id, phase="planning"),
@@ -264,6 +266,7 @@ class BoaController:
             allowed_paths=list(self.config.guardrails.allowed_paths),
             protected_paths=list(self.config.guardrails.protected_paths),
             recent_trials=recent_trials,
+            bootstrap_tool_calls=load_search_trace(self._search_trace_path(trial_id)),
             objective_summary=self._objective_summary(),
             preflight_commands=list(self.config.guardrails.preflight_commands),
             max_agent_steps=int(self.config.agent.max_agent_steps),
@@ -273,6 +276,17 @@ class BoaController:
             candidate_output_path=self._candidate_output_path(trial_id),
             candidate_plan=candidate_plan,
         )
+
+    def _record_planning_bootstrap_calls(self, *, trial_id: str, recent_trials: list[TrialSummary]) -> list[SearchToolCall]:
+        trace_path = self._search_trace_path(trial_id)
+        oracle = self._search_oracle(recent_trials)
+        toolbox = SearchToolbox(
+            oracle=oracle,
+            recorder=SearchTraceRecorder(trace_path=trace_path, phase="planning", observer=self.observer),
+        )
+        toolbox.recent_trials({"limit": self.config.search.max_history})
+        toolbox.list_lineage_options({"limit": self.config.search.max_history})
+        return load_search_trace(trace_path)
 
     def _stage_config(self, stage_name: str):
         return getattr(self.config.runner, stage_name)
@@ -458,6 +472,7 @@ class BoaController:
         parent_trial_id: str | None,
         candidate: CandidateMetadata,
     ):
+        scratch_paths = self.worktree.cleanup_scratch_artifacts()
         touched = self.worktree.validate_changed_paths(
             allowed_paths=self.config.guardrails.allowed_paths,
             protected_paths=self.config.guardrails.protected_paths,
@@ -495,6 +510,14 @@ class BoaController:
             trial_id=trial_id,
             phase="execution",
         )
+        if scratch_paths:
+            self._emit(
+                kind="execution_scratch_cleaned",
+                message=f"Removed scratch artifacts before validation: {', '.join(scratch_paths[:3])}",
+                trial_id=trial_id,
+                phase="execution",
+                metadata={"count": len(scratch_paths)},
+            )
         return artifact_dir, diff_path, descriptor
 
     @staticmethod
@@ -786,6 +809,14 @@ class BoaController:
                     metadata={"parent_branch": candidate_plan.selected_parent_branch},
                 )
                 self._write_plan_artifact(trial_id=trial_id, candidate_plan=candidate_plan)
+                # Write plan.json from the BOA process so the execution agent can read it,
+                # regardless of whether the planning agent could write it directly.
+                plan_out = self._plan_output_path(trial_id)
+                plan_out.parent.mkdir(parents=True, exist_ok=True)
+                plan_out.write_text(
+                    json.dumps(asdict(candidate_plan), indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
                 self._validate_informed_by_call_ids(
                     candidate_plan.informed_by_call_ids,
                     load_search_trace(self._search_trace_path(trial_id)),

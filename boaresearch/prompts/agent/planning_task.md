@@ -2,17 +2,22 @@ Trial id: {trial_id}
 
 {objective_summary}
 
-Write the candidate plan JSON to:
+BOA-owned candidate plan artifact path for reference:
 `{plan_output_path}`
 
 Recent trials:
 {recent_trials}
 
+Bootstrap BOA search context:
+{bootstrap_tool_calls}
+
 Requirements:
-1. Use BOA search tools before choosing a parent branch.
-2. Choose `selected_parent_branch` from `boa tools list-lineage-options` only.
+1. Use BOA search information before choosing a parent branch. If shell or CLI tool execution is blocked, use the provided bootstrap BOA search context.
+2. Choose `selected_parent_branch` from the provided lineage options or from `boa tools list-lineage-options` only.
 3. Do not commit, push, or finalize a patch in this phase.
 4. Prefer the accepted branch when BOA memory is sparse or lineage evidence is weak.
-5. Write exactly one candidate plan JSON object to `{plan_output_path}` and print the same JSON to stdout as a fallback.
-6. `informed_by_call_ids` must list the BOA tool call ids that materially informed the plan.
-7. Do not scan `.boa/` to rediscover BOA paths. The output path and tool launcher path are already provided above.
+5. Do not attempt to write directly to `{plan_output_path}` when it is under `.boa/protected`; print exactly one candidate plan JSON object to stdout and let BOA persist the artifact.
+6. `informed_by_call_ids` must list the BOA tool call ids that materially informed the plan. You may cite the bootstrap call ids above if they materially informed your decision.
+7. Do not try to create, inspect, or validate `.boa/` output directories. BOA already manages those paths.
+8. If a shell or tool suggests creating files under `.boa/protected`, stop and print the single final JSON object to stdout instead.
+9. Do not scan `.boa/` to rediscover BOA paths. The output path and tool launcher path are already provided above.

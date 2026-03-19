@@ -60,8 +60,9 @@ class SearchOracleService:
 
     def validate_parent_selection(self, *, branch_name: str, trial_id: str | None) -> dict[str, Any] | None:
         if branch_name == self.accepted_branch:
-            if trial_id not in {None, ""}:
-                return None
+            # Some adapters may include a stale or non-empty selected_parent_trial_id
+            # even when selecting the accepted branch. The accepted branch is always
+            # a valid lineage root, so normalize trial_id away in this case.
             return {
                 "branch_name": self.accepted_branch,
                 "trial_id": None,

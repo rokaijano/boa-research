@@ -94,6 +94,36 @@ def prune_worktrees(repo_path: Path) -> None:
     run_git(repo_path, ["worktree", "prune"], capture_output=True)
 
 
+def remove_worktree(repo_path: Path, worktree_path: Path) -> None:
+    """Force-remove a registered worktree by path (silently ignores failures)."""
+    run_git(repo_path, ["worktree", "remove", "--force", str(worktree_path)], check=False, capture_output=True)
+
+
+def worktree_paths_for_branch(repo_path: Path, branch: str) -> list[Path]:
+    """Return all registered worktree paths that have *branch* checked out."""
+    proc = run_git(repo_path, ["worktree", "list", "--porcelain"], check=False)
+    result: list[Path] = []
+    current_wt_path: Path | None = None
+    current_branch: str | None = None
+    for raw_line in (proc.stdout or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("worktree "):
+            current_wt_path = Path(line[len("worktree "):])
+            current_branch = None
+        elif line.startswith("branch "):
+            ref = line[len("branch "):]
+            current_branch = ref.removeprefix("refs/heads/")
+        elif not line:
+            if current_wt_path is not None and current_branch == branch:
+                result.append(current_wt_path)
+            current_wt_path = None
+            current_branch = None
+    # handle a final entry with no trailing blank line
+    if current_wt_path is not None and current_branch == branch:
+        result.append(current_wt_path)
+    return result
+
+
 def checkout(repo_path: Path, branch: str) -> None:
     run_git(repo_path, ["checkout", branch], capture_output=True)
 

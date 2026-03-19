@@ -10,6 +10,9 @@ from typing import Mapping
 from .runtime.observer import RunEvent, RunObserver
 
 
+_AGENT_HEARTBEAT_INTERVAL_SECONDS = 5.0
+
+
 def run_process_with_live_output(
     command: list[str],
     *,
@@ -54,10 +57,13 @@ def run_process_with_live_output(
             return
         try:
             proc.stdin.write(input_text)
-        except BrokenPipeError:
+        except (BrokenPipeError, OSError):
             return
         finally:
-            proc.stdin.close()
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
 
     stdout_thread = threading.Thread(
         target=pump,
@@ -76,6 +82,7 @@ def run_process_with_live_output(
 
     deadline = time.monotonic() + timeout_seconds
     timed_out = False
+    last_agent_heartbeat = time.monotonic()
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0 and proc.poll() is None:
@@ -93,7 +100,25 @@ def run_process_with_live_output(
                     source=source,
                 )
             )
+            last_agent_heartbeat = time.monotonic()
         except Empty:
+            now = time.monotonic()
+            if (
+                proc.poll() is None
+                and stdout_source.startswith("agent.")
+                and now - last_agent_heartbeat >= _AGENT_HEARTBEAT_INTERVAL_SECONDS
+            ):
+                observer.emit(
+                    RunEvent(
+                        kind="process_waiting",
+                        message="Agent process still running...",
+                        trial_id=trial_id,
+                        phase=phase,
+                        stage_name=stage_name,
+                        source=stdout_source,
+                    )
+                )
+                last_agent_heartbeat = now
             if proc.poll() is not None and not stdout_thread.is_alive() and not stderr_thread.is_alive():
                 break
 

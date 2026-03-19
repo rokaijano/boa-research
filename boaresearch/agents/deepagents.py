@@ -15,6 +15,7 @@ from ..prompt_builder import (
 from ..schema import AgentExecutionContext, AgentPlanningContext, CandidateMetadata, CandidatePlan
 from ..search import SearchOracleService, SearchToolbox, SearchTraceRecorder, read_search_tool_context
 from .base import BaseResearchAgent, ResearchAgentError
+from .interaction import BoaInteractionLayer
 from .tools import AgentToolHarness, CandidatePlanSubmissionRecorder, CandidateSubmissionRecorder, build_agent_tools
 
 
@@ -50,11 +51,14 @@ class DeepAgentsResearchAgent(BaseResearchAgent):
         agent_config,
         config,
         run_preflight,
+        observer=None,
     ) -> None:
         self.repo_root = repo_root
         self.agent_config = agent_config
         self.config = config
         self._run_preflight = run_preflight
+        self.observer = observer
+        self.interaction = BoaInteractionLayer()
 
     def _build_model(self):
         init_chat_model = _import_attr(
@@ -132,7 +136,7 @@ class DeepAgentsResearchAgent(BaseResearchAgent):
     def _search_tools(self, *, recent_trials, accepted_branch: str, tool_context_path: Path) -> SearchToolbox:
         tool_context = read_search_tool_context(tool_context_path)
         oracle = SearchOracleService(config=self.config, memory=recent_trials, accepted_branch=accepted_branch)
-        recorder = SearchTraceRecorder(trace_path=tool_context.trace_path, phase=tool_context.phase)
+        recorder = SearchTraceRecorder(trace_path=tool_context.trace_path, phase=tool_context.phase, observer=self.observer)
         return SearchToolbox(oracle=oracle, recorder=recorder)
 
     def _memories_path(self, run_tag: str) -> Path:
@@ -174,6 +178,7 @@ class DeepAgentsResearchAgent(BaseResearchAgent):
         )
         if recorder.plan is None:
             raise ResearchAgentError("DeepAgents must call submit_candidate_plan() before returning control")
+        self.interaction.persist_plan(plan_path=context.plan_output_path, plan=recorder.plan)
         return recorder.plan
 
     def prepare_candidate(self, context: AgentExecutionContext) -> CandidateMetadata:
@@ -198,4 +203,5 @@ class DeepAgentsResearchAgent(BaseResearchAgent):
         )
         if recorder.candidate is None:
             raise ResearchAgentError("DeepAgents must call submit_candidate() before returning control")
+        self.interaction.persist_candidate(candidate_path=context.candidate_output_path, candidate=recorder.candidate)
         return recorder.candidate

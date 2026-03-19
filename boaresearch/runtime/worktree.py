@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -66,6 +67,11 @@ class WorktreeManager:
 
     def prepare_trial(self, *, trial_branch: str, parent_branch: str) -> None:
         git_state.prune_worktrees(self.repo_root)
+        # Evict any stale worktree that has the target branch checked out at a
+        # different path (e.g. left over after a layout migration).
+        for stale_path in git_state.worktree_paths_for_branch(self.repo_root, trial_branch):
+            if stale_path.resolve() != self.worktree_path.resolve():
+                git_state.remove_worktree(self.repo_root, stale_path)
         self.worktree_path.parent.mkdir(parents=True, exist_ok=True)
         if not (self.worktree_path / ".git").exists():
             git_state.add_worktree(self.repo_root, self.worktree_path, trial_branch, parent_branch)
@@ -76,6 +82,24 @@ class WorktreeManager:
 
     def changed_paths(self) -> list[str]:
         return [_normalize_repo_path(path) for path in git_state.changed_paths(self.worktree_path)]
+
+    def cleanup_scratch_artifacts(self) -> list[str]:
+        """Remove common agent scratch paths that should never become part of a patch."""
+        cleaned: list[str] = []
+        for candidate in self.worktree_path.iterdir():
+            if candidate.name in {".git"}:
+                continue
+            if not (candidate.name.startswith("_tmp_") or candidate.name.startswith("tmp_")):
+                continue
+            if candidate.is_dir():
+                shutil.rmtree(candidate, ignore_errors=True)
+            else:
+                try:
+                    candidate.unlink()
+                except FileNotFoundError:
+                    pass
+            cleaned.append(candidate.name)
+        return cleaned
 
     def diff_text(self, *, base_ref: str) -> str:
         return git_state.diff_text(self.worktree_path, base_ref=base_ref)

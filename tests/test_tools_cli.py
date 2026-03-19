@@ -36,7 +36,7 @@ class ToolsCliTests(unittest.TestCase):
 
                 [guardrails]
                 allowed_paths = ["src"]
-                protected_paths = [".boa"]
+                protected_paths = [".boa/protected"]
 
                 [runner]
                 mode = "local"

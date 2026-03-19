@@ -319,6 +319,7 @@ class AgentPlanningContext:
     allowed_paths: list[str]
     protected_paths: list[str]
     recent_trials: list[TrialSummary]
+    bootstrap_tool_calls: list[SearchToolCall]
     objective_summary: str
     max_agent_steps: int
     prompt_bundle_dir: Path
@@ -341,6 +342,7 @@ class AgentExecutionContext:
     allowed_paths: list[str]
     protected_paths: list[str]
     recent_trials: list[TrialSummary]
+    bootstrap_tool_calls: list[SearchToolCall]
     objective_summary: str
     preflight_commands: list[str]
     max_agent_steps: int

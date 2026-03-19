@@ -22,9 +22,12 @@ Primary contract ({boa_md_display_path}):
 BOA search tools are available as callable tools and through the BOA-managed CLI launcher:
 `{tool_command} tools recent-trials`, `{tool_command} tools list-lineage-options`, `{tool_command} tools suggest-parents`, `{tool_command} tools score-candidate-descriptor`, `{tool_command} tools rank-patch-families`, `{tool_command} tools propose-numeric-knob-regions`.
 
-When using the CLI form, send the request as JSON on stdin. Do not invent extra flags such as `--trial-id`; the current trial context is already provided by BOA. Use the launcher path exactly as provided here instead of assuming a global `boa` install.
+When using the CLI form, send the request as JSON on stdin. Do not invent extra flags such as `--trial-id`; the current trial context is already provided by BOA. Use the BOA CLI command exactly as provided here instead of assuming a global `boa` install or trying to execute workspace-local helper scripts directly.
 Examples:
-- `printf '{{}}' | {tool_command_quoted} tools list-lineage-options`
-- `printf '{{"patch_category":"optimizer","operation_type":"replace","estimated_risk":0.25}}' | {tool_command_quoted} tools suggest-parents`
+- `{tool_list_lineage_options_example}`
+- `{tool_suggest_parents_example}`
+
+When inspecting files on Windows, prefer `rg --files src/mnist_demo` and `rg -n PATTERN src/mnist_demo`; avoid glob patterns like `src/mnist_demo/*.py` because PowerShell does not expand them the way a shell script would.
+Do not leave scratch artifacts in the worktree, including directories such as `_tmp_artifacts`; use the OS temp directory if you need temporary files.
 
 Planning phase: inspect the accepted-branch workspace, use BOA tools to choose a lineage and strategy, and emit exactly one candidate plan JSON object.

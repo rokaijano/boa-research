@@ -113,6 +113,7 @@ class FakeAgent:
         self.bad_plan_call_id = bad_plan_call_id
         self.bad_candidate_call_id = bad_candidate_call_id
         self.prepare_called = False
+        self.plan_parent_trial_id: str | None = None
 
     def plan_trial(self, context) -> CandidatePlan:
         tool_context = read_search_tool_context(context.tool_context_path)
@@ -122,7 +123,11 @@ class FakeAgent:
             hypothesis="h",
             rationale_summary="plan",
             selected_parent_branch=self.plan_branch,
-            selected_parent_trial_id=None if self.plan_branch == "boa/demo/accepted" else "prior-0001",
+            selected_parent_trial_id=(
+                self.plan_parent_trial_id
+                if self.plan_parent_trial_id is not None
+                else (None if self.plan_branch == "boa/demo/accepted" else "prior-0001")
+            ),
             patch_category="optimizer",
             operation_type="replace",
             estimated_risk=0.2,
@@ -190,7 +195,7 @@ class ControllerTests(unittest.TestCase):
         controller = BoaController(build_config(repo), observer=observer)
         controller.agent = fake_agent
         controller.runner = runner or FakeRunner()
-        controller.worktree = worktree or FakeWorktree(repo / ".boa" / "worktrees" / "demo")
+        controller.worktree = worktree or FakeWorktree(repo / ".boa" / "worktree" / "demo")
         controller._ensure_ready = lambda: controller.store.ensure_schema()  # type: ignore[method-assign]
         controller._seed_baseline = lambda stage_name: None  # type: ignore[method-assign]
         controller._run_preflight = lambda: None  # type: ignore[method-assign]
@@ -218,7 +223,7 @@ class ControllerTests(unittest.TestCase):
             canonical_score=0.7,
         )
 
-    def test_tool_context_trace_path_is_inside_worktree_for_agent_sandbox(self) -> None:
+    def test_tool_context_trace_path_is_inside_protected_runtime(self) -> None:
         controller, _repo = self._controller(fake_agent=FakeAgent(plan_branch="boa/demo/accepted"))
         controller._prepare_planning_workspace()
 
@@ -226,12 +231,12 @@ class ControllerTests(unittest.TestCase):
         tool_context = read_search_tool_context(context.tool_context_path)
 
         self.assertIsNotNone(tool_context.trace_path)
-        self.assertTrue(str(tool_context.trace_path).startswith(str(controller.worktree.worktree_path)))
-        self.assertIn("/.boa/agent_traces/demo-0001/search_calls.jsonl", str(tool_context.trace_path))
-        self.assertTrue(str(context.plan_output_path).startswith(str(controller.worktree.worktree_path)))
-        self.assertIn("/.boa/agent_outputs/demo-0001/plan.json", str(context.plan_output_path))
+        self.assertTrue(str(tool_context.trace_path).startswith(str(controller.paths.protected_root)))
+        self.assertIn("/.boa/protected/agent_traces/demo-0001/search_calls.jsonl", str(tool_context.trace_path).replace("\\", "/"))
+        self.assertTrue(str(context.plan_output_path).startswith(str(controller.paths.protected_root)))
+        self.assertIn("/.boa/protected/agent_outputs/demo-0001/plan.json", str(context.plan_output_path).replace("\\", "/"))
 
-    def test_execution_candidate_output_path_is_inside_worktree_for_agent_sandbox(self) -> None:
+    def test_execution_candidate_output_path_is_inside_protected_runtime(self) -> None:
         controller, _repo = self._controller(fake_agent=FakeAgent(plan_branch="boa/demo/accepted"))
         controller._prepare_planning_workspace()
 
@@ -253,8 +258,8 @@ class ControllerTests(unittest.TestCase):
             candidate_plan=candidate_plan,
         )
 
-        self.assertTrue(str(context.candidate_output_path).startswith(str(controller.worktree.worktree_path)))
-        self.assertIn("/.boa/agent_outputs/demo-0001/candidate.json", str(context.candidate_output_path))
+        self.assertTrue(str(context.candidate_output_path).startswith(str(controller.paths.protected_root)))
+        self.assertIn("/.boa/protected/agent_outputs/demo-0001/candidate.json", str(context.candidate_output_path).replace("\\", "/"))
 
     def test_run_uses_prior_trial_parent_and_accepts(self) -> None:
         controller, _repo = self._controller(fake_agent=FakeAgent(plan_branch="boa/demo/trial/prior-0001"))
@@ -267,6 +272,17 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(controller.worktree.prepared[0], ("boa/demo/accepted", "boa/demo/accepted"))
         self.assertEqual(controller.worktree.prepared[1][1], "boa/demo/trial/prior-0001")
         self.assertTrue(controller.worktree.promoted)
+        self.assertEqual(created.acceptance_status, "completed_accepted")
+
+    def test_accepted_parent_with_nonempty_trial_id_is_normalized_and_runs(self) -> None:
+        fake_agent = FakeAgent(plan_branch="boa/demo/accepted")
+        fake_agent.plan_parent_trial_id = "prior-0001"
+        controller, _repo = self._controller(fake_agent=fake_agent)
+
+        controller.run()
+
+        recent = controller.store.recent_trials(limit=5, run_tag="demo")
+        created = next(trial for trial in recent if trial.trial_id == "demo-0001")
         self.assertEqual(created.acceptance_status, "completed_accepted")
 
     def test_invalid_parent_is_rejected_before_execution(self) -> None:
@@ -294,7 +310,7 @@ class ControllerTests(unittest.TestCase):
         summary = controller.run()
 
         self.assertEqual(summary.last_acceptance_status, "policy_rejected")
-        self.assertIn("recorded no tool calls", summary.last_detail or "")
+        self.assertIn("Unknown BOA tool call ids referenced", summary.last_detail or "")
 
     def test_second_controller_run_uses_next_trial_id(self) -> None:
         repo = Path(tempfile.mkdtemp())
@@ -310,7 +326,7 @@ class ControllerTests(unittest.TestCase):
         controller, _repo = self._controller(
             fake_agent=FakeAgent(plan_branch="boa/demo/accepted"),
             repo=repo,
-            worktree=NoPatchWorktree(repo / ".boa" / "worktrees" / "demo"),
+            worktree=NoPatchWorktree(repo / ".boa" / "worktree" / "demo"),
         )
         controller.run()
         recent = controller.store.recent_trials(limit=5, run_tag="demo")
@@ -379,7 +395,7 @@ class ControllerTests(unittest.TestCase):
         controller = BoaController(build_config(repo))
         controller.agent = FakeAgent(plan_branch="boa/demo/accepted")
         controller.runner = FakeRunner(status="metric_missing")
-        controller.worktree = FakeWorktree(repo / ".boa" / "worktrees" / "demo")
+        controller.worktree = FakeWorktree(repo / ".boa" / "worktree" / "demo")
         controller.store.ensure_schema()
         controller._ensure_ready = lambda: controller.store.ensure_schema()  # type: ignore[method-assign]
         controller._run_preflight = lambda: None  # type: ignore[method-assign]
