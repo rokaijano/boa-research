@@ -13,6 +13,7 @@ authors = [
 ]
 dependencies = [
   "InquirerPy>=0.3.4,<1",
+  "rich>=13,<15",
 ]
 
 [project.optional-dependencies]

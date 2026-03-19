@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -10,13 +11,18 @@ from .schema import AgentExecutionContext, AgentPlanningContext, OPERATION_TYPES
 
 PLAN_SCHEMA: dict[str, Any] = {
     "type": "object",
+    "additionalProperties": False,
     "required": [
         "hypothesis",
         "rationale_summary",
         "selected_parent_branch",
+        "selected_parent_trial_id",
         "patch_category",
         "operation_type",
         "estimated_risk",
+        "target_symbols",
+        "numeric_knobs",
+        "notes",
         "informed_by_call_ids",
     ],
     "properties": {
@@ -52,12 +58,16 @@ PLAN_EXAMPLE = {
 
 CANDIDATE_SCHEMA: dict[str, Any] = {
     "type": "object",
+    "additionalProperties": False,
     "required": [
         "hypothesis",
         "rationale_summary",
         "patch_category",
         "operation_type",
         "estimated_risk",
+        "target_symbols",
+        "numeric_knobs",
+        "notes",
         "informed_by_call_ids",
     ],
     "properties": {
@@ -114,7 +124,12 @@ def _supplemental_sections(*, repo_root: Path, extra_context_files: list[Path]) 
     return "\n\n".join(sections) if sections else "<no supplemental repo instructions>"
 
 
-def build_planning_system_prompt(*, repo_root: Path, context: AgentPlanningContext) -> str:
+def build_planning_system_prompt(
+    *,
+    repo_root: Path,
+    context: AgentPlanningContext,
+    tool_command: str = "boa",
+) -> str:
     return render_prompt_template(
         "agent",
         "planning_system.md",
@@ -124,10 +139,17 @@ def build_planning_system_prompt(*, repo_root: Path, context: AgentPlanningConte
         boa_md_display_path=_display_path(context.boa_md_path, repo_root),
         boa_md_text=_read_text(context.boa_md_path, limit=None),
         supplemental_sections=_supplemental_sections(repo_root=repo_root, extra_context_files=context.extra_context_files),
+        tool_command=tool_command,
+        tool_command_quoted=shlex.quote(tool_command),
     )
 
 
-def build_execution_system_prompt(*, repo_root: Path, context: AgentExecutionContext) -> str:
+def build_execution_system_prompt(
+    *,
+    repo_root: Path,
+    context: AgentExecutionContext,
+    tool_command: str = "boa",
+) -> str:
     return render_prompt_template(
         "agent",
         "execution_system.md",
@@ -139,6 +161,8 @@ def build_execution_system_prompt(*, repo_root: Path, context: AgentExecutionCon
         supplemental_sections=_supplemental_sections(repo_root=repo_root, extra_context_files=context.extra_context_files),
         parent_branch=context.parent_branch,
         trial_branch=context.trial_branch,
+        tool_command=tool_command,
+        tool_command_quoted=shlex.quote(tool_command),
     )
 
 
@@ -162,6 +186,7 @@ def build_planning_task(context: AgentPlanningContext) -> str:
         "planning_task.md",
         trial_id=context.trial_id,
         objective_summary=context.objective_summary,
+        plan_output_path=str(context.plan_output_path),
         recent_trials="\n".join(recent_lines) if recent_lines else "<no prior trials recorded>",
     )
 
@@ -188,14 +213,21 @@ def build_execution_task(context: AgentExecutionContext) -> str:
         objective_summary=context.objective_summary,
         parent_branch=context.parent_branch,
         parent_trial_id=context.parent_trial_id or "none",
+        plan_output_path=str(context.plan_output_path),
+        candidate_output_path=str(context.candidate_output_path),
         candidate_plan_json=json.dumps(context.candidate_plan.__dict__, indent=2, sort_keys=True),
         recent_trials="\n".join(recent_lines) if recent_lines else "<no prior trials recorded>",
         preflight_commands="\n".join(context.preflight_commands) if context.preflight_commands else "<none>",
     )
 
 
-def build_cli_planning_bundle(*, repo_root: Path, context: AgentPlanningContext) -> dict[str, str]:
-    system_prompt = build_planning_system_prompt(repo_root=repo_root, context=context)
+def build_cli_planning_bundle(
+    *,
+    repo_root: Path,
+    context: AgentPlanningContext,
+    tool_command: str = "boa",
+) -> dict[str, str]:
+    system_prompt = build_planning_system_prompt(repo_root=repo_root, context=context, tool_command=tool_command)
     task_prompt = build_planning_task(context)
     output_instructions = "\n\n".join(
         [
@@ -223,8 +255,13 @@ def build_cli_planning_bundle(*, repo_root: Path, context: AgentPlanningContext)
     }
 
 
-def build_cli_execution_bundle(*, repo_root: Path, context: AgentExecutionContext) -> dict[str, str]:
-    system_prompt = build_execution_system_prompt(repo_root=repo_root, context=context)
+def build_cli_execution_bundle(
+    *,
+    repo_root: Path,
+    context: AgentExecutionContext,
+    tool_command: str = "boa",
+) -> dict[str, str]:
+    system_prompt = build_execution_system_prompt(repo_root=repo_root, context=context, tool_command=tool_command)
     task_prompt = build_execution_task(context)
     output_instructions = "\n\n".join(
         [

@@ -12,6 +12,8 @@ from typing import Optional
 
 from .git_auth import GitAuthManager
 from .metrics import MetricExtractionError, extract_metrics
+from .process import run_process_with_live_output
+from .runtime.observer import RunEvent
 from .schema import LocalRunnerConfig, MetricConfig, RunnerStageConfig, SSHRunnerConfig, StageCommandResult
 
 
@@ -79,8 +81,31 @@ class BaseTrialRunner(ABC):
 
 
 class LocalTrialRunner(BaseTrialRunner):
-    def __init__(self, config: LocalRunnerConfig) -> None:
+    def __init__(self, config: LocalRunnerConfig, *, observer=None) -> None:
         self.config = config
+        self.observer = observer
+
+    def _emit(
+        self,
+        *,
+        kind: str,
+        message: str,
+        trial_id: str,
+        stage_name: str,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        if self.observer is None:
+            return
+        self.observer.emit(
+            RunEvent(
+                kind=kind,
+                message=message,
+                trial_id=trial_id,
+                phase="evaluation",
+                stage_name=stage_name,
+                metadata=dict(metadata or {}),
+            )
+        )
 
     def _command_script(self, command: str) -> str:
         if self.config.activation_command:
@@ -98,7 +123,6 @@ class LocalTrialRunner(BaseTrialRunner):
         metrics: list[MetricConfig],
         artifact_dir: Path,
     ) -> StageExecution:
-        del trial_id
         stage_artifact_dir = (artifact_dir / stage_name).resolve()
         stage_artifact_dir.mkdir(parents=True, exist_ok=True)
         started_at = utc_now()
@@ -111,16 +135,39 @@ class LocalTrialRunner(BaseTrialRunner):
             stdout_path = stage_artifact_dir / f"command_{index:03d}.stdout"
             stderr_path = stage_artifact_dir / f"command_{index:03d}.stderr"
             command_started_at = datetime.now(timezone.utc)
+            self._emit(
+                kind="stage_command_started",
+                message=f"Running stage command {index}",
+                trial_id=trial_id,
+                stage_name=stage_name,
+                metadata={"command": command, "command_index": index},
+            )
             try:
-                proc = subprocess.run(
-                    _shell_args(self._command_script(command)),
-                    cwd=str(worktree_path),
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    env=env,
-                    timeout=int(stage.timeout_seconds),
-                )
+                shell_command = _shell_args(self._command_script(command))
+                if self.observer is None:
+                    proc = subprocess.run(
+                        shell_command,
+                        cwd=str(worktree_path),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        env=env,
+                        timeout=int(stage.timeout_seconds),
+                    )
+                else:
+                    proc = run_process_with_live_output(
+                        shell_command,
+                        cwd=worktree_path,
+                        env=env,
+                        input_text=None,
+                        timeout_seconds=int(stage.timeout_seconds),
+                        observer=self.observer,
+                        trial_id=trial_id,
+                        phase="evaluation",
+                        stage_name=stage_name,
+                        stdout_source="stage.stdout",
+                        stderr_source="stage.stderr",
+                    )
                 stdout_path.write_text(proc.stdout or "", encoding="utf-8")
                 stderr_path.write_text(proc.stderr or "", encoding="utf-8")
                 command_status = "ok" if proc.returncode == 0 else "failed"
@@ -144,6 +191,13 @@ class LocalTrialRunner(BaseTrialRunner):
                     wall_time_seconds=max(0.0, (command_finished_at - command_started_at).total_seconds()),
                     max_rss_kb=None,
                 )
+            )
+            self._emit(
+                kind="stage_command_completed",
+                message=f"Stage command {index} finished with status {command_status}",
+                trial_id=trial_id,
+                stage_name=stage_name,
+                metadata={"command": command, "command_index": index, "status": command_status},
             )
             if command_status != "ok":
                 break
@@ -180,9 +234,32 @@ class LocalTrialRunner(BaseTrialRunner):
 class SSHTrialRunner(BaseTrialRunner):
     requires_remote_branches = True
 
-    def __init__(self, config: SSHRunnerConfig, *, git_auth: Optional[GitAuthManager] = None) -> None:
+    def __init__(self, config: SSHRunnerConfig, *, git_auth: Optional[GitAuthManager] = None, observer=None) -> None:
         self.config = config
         self.git_auth = git_auth
+        self.observer = observer
+
+    def _emit(
+        self,
+        *,
+        kind: str,
+        message: str,
+        trial_id: str,
+        stage_name: str,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        if self.observer is None:
+            return
+        self.observer.emit(
+            RunEvent(
+                kind=kind,
+                message=message,
+                trial_id=trial_id,
+                phase="evaluation",
+                stage_name=stage_name,
+                metadata=dict(metadata or {}),
+            )
+        )
 
     def _target(self) -> str:
         if self.config.host_alias:
@@ -285,9 +362,9 @@ class SSHTrialRunner(BaseTrialRunner):
                     "set +e",
                     (
                         "if command -v /usr/bin/time >/dev/null 2>&1; then "
-                        f"timeout {int(stage.timeout_seconds)} /usr/bin/time -f '%M' -o \"$cmd_rss\" bash -lc {quoted_command} >\"$cmd_stdout\" 2>\"$cmd_stderr\"; "
-                        f"elif command -v gtime >/dev/null 2>&1; then timeout {int(stage.timeout_seconds)} gtime -f '%M' -o \"$cmd_rss\" bash -lc {quoted_command} >\"$cmd_stdout\" 2>\"$cmd_stderr\"; "
-                        f"else timeout {int(stage.timeout_seconds)} bash -lc {quoted_command} >\"$cmd_stdout\" 2>\"$cmd_stderr\"; fi"
+                        f"timeout {int(stage.timeout_seconds)} /usr/bin/time -f '%M' -o \"$cmd_rss\" bash -lc {quoted_command} > >(tee \"$cmd_stdout\") 2> >(tee \"$cmd_stderr\" >&2); "
+                        f"elif command -v gtime >/dev/null 2>&1; then timeout {int(stage.timeout_seconds)} gtime -f '%M' -o \"$cmd_rss\" bash -lc {quoted_command} > >(tee \"$cmd_stdout\") 2> >(tee \"$cmd_stderr\" >&2); "
+                        f"else timeout {int(stage.timeout_seconds)} bash -lc {quoted_command} > >(tee \"$cmd_stdout\") 2> >(tee \"$cmd_stderr\" >&2); fi"
                     ),
                     "cmd_exit=$?",
                     "set -e",
@@ -362,8 +439,30 @@ class SSHTrialRunner(BaseTrialRunner):
         stage_artifact_dir = (artifact_dir / stage_name).resolve()
         stage_artifact_dir.mkdir(parents=True, exist_ok=True)
         script_timeout = max(60, len(stage.commands) * int(stage.timeout_seconds) + 120)
+        self._emit(
+            kind="stage_remote_started",
+            message=f"Executing remote stage '{stage_name}' on {self._target()}",
+            trial_id=trial_id,
+            stage_name=stage_name,
+            metadata={"target": self._target()},
+        )
         try:
-            proc = self._run_remote_script(script, timeout_seconds=script_timeout)
+            if self.observer is None:
+                proc = self._run_remote_script(script, timeout_seconds=script_timeout)
+            else:
+                proc = run_process_with_live_output(
+                    [*self._ssh_base_args(), "bash", "-lc", script],
+                    cwd=Path.cwd(),
+                    env=os.environ.copy(),
+                    input_text=None,
+                    timeout_seconds=script_timeout,
+                    observer=self.observer,
+                    trial_id=trial_id,
+                    phase="evaluation",
+                    stage_name=stage_name,
+                    stdout_source="remote.stdout",
+                    stderr_source="remote.stderr",
+                )
         except subprocess.TimeoutExpired as exc:
             (stage_artifact_dir / "stage_setup.stderr").write_text(str(exc), encoding="utf-8")
             now = utc_now()
@@ -394,6 +493,12 @@ class SSHTrialRunner(BaseTrialRunner):
                 completed_at=now,
             )
         self._fetch_stage_dir(remote_stage_dir=remote_stage_dir, local_stage_dir=stage_artifact_dir)
+        self._emit(
+            kind="stage_remote_completed",
+            message=f"Fetched remote artifacts for stage '{stage_name}'",
+            trial_id=trial_id,
+            stage_name=stage_name,
+        )
         stage_env = _parse_env_file(stage_artifact_dir / "stage.env")
         command_results: list[StageCommandResult] = []
         commands_tsv = stage_artifact_dir / "commands.tsv"
@@ -446,9 +551,9 @@ class SSHTrialRunner(BaseTrialRunner):
         )
 
 
-def build_trial_runner(config, *, git_auth: Optional[GitAuthManager] = None) -> BaseTrialRunner:
+def build_trial_runner(config, *, git_auth: Optional[GitAuthManager] = None, observer=None) -> BaseTrialRunner:
     if config.runner.mode == "local":
-        return LocalTrialRunner(config.runner.local)
+        return LocalTrialRunner(config.runner.local, observer=observer)
     if config.runner.mode == "ssh":
-        return SSHTrialRunner(config.runner.ssh, git_auth=git_auth)
+        return SSHTrialRunner(config.runner.ssh, git_auth=git_auth, observer=observer)
     raise ValueError(f"Unsupported runner.mode: {config.runner.mode}")

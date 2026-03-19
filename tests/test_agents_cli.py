@@ -9,6 +9,9 @@ from unittest.mock import patch
 
 from boaresearch.agents.cli import CliResearchAgent
 from boaresearch.agents.deepagents import DeepAgentsResearchAgent
+from boaresearch.prompt_builder import CANDIDATE_SCHEMA, PLAN_SCHEMA, build_execution_system_prompt, build_planning_system_prompt
+from boaresearch.prompt_builder import build_execution_task, build_planning_task
+from boaresearch.runtime.observer import RunEvent
 from boaresearch.schema import (
     AgentConfig,
     AgentExecutionContext,
@@ -23,6 +26,14 @@ from boaresearch.schema import (
     SearchConfig,
 )
 from boaresearch.search import SearchToolContext, write_search_tool_context
+
+
+class RecordingObserver:
+    def __init__(self) -> None:
+        self.events: list[RunEvent] = []
+
+    def emit(self, event: RunEvent) -> None:
+        self.events.append(event)
 
 
 def _write_tool_context_file(path: Path, repo_root: Path, phase: str) -> None:
@@ -122,6 +133,66 @@ def _minimal_config(repo: Path) -> BoaConfig:
 
 
 class CliAgentTests(unittest.TestCase):
+    def test_codex_output_schemas_disable_additional_properties(self) -> None:
+        self.assertIs(PLAN_SCHEMA["additionalProperties"], False)
+        self.assertIs(CANDIDATE_SCHEMA["additionalProperties"], False)
+        self.assertEqual(sorted(PLAN_SCHEMA["required"]), sorted(PLAN_SCHEMA["properties"].keys()))
+        self.assertEqual(sorted(CANDIDATE_SCHEMA["required"]), sorted(CANDIDATE_SCHEMA["properties"].keys()))
+
+    def test_system_prompts_explain_tools_use_json_stdin(self) -> None:
+        repo = _make_repo()
+        tool_command = str(repo / "prompts" / "boa-tools")
+        planning_prompt = build_planning_system_prompt(repo_root=repo, context=_planning_context(repo), tool_command=tool_command)
+        execution_prompt = build_execution_system_prompt(
+            repo_root=repo,
+            context=_execution_context(repo),
+            tool_command=tool_command,
+        )
+
+        self.assertIn("Do not invent extra flags such as `--trial-id`", planning_prompt)
+        self.assertIn(str(tool_command), planning_prompt)
+        self.assertIn("tools list-lineage-options", planning_prompt)
+        self.assertIn("Do not invent extra flags such as `--trial-id`", execution_prompt)
+
+    def test_plan_trial_writes_boa_tools_launcher_into_prompt_bundle(self) -> None:
+        repo = _make_repo()
+        context = _planning_context(repo)
+        agent = CliResearchAgent(
+            repo_root=repo,
+            agent_config=AgentConfig(preset="custom", runtime="cli", command="python3", args=["-c", "print('{{}}')"]),
+        )
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-1"]}',
+                stderr="",
+            )
+            agent.plan_trial(context)
+        launcher_path = context.prompt_bundle_dir / "boa-tools"
+        launcher_text = launcher_path.read_text(encoding="utf-8")
+        planning_prompt = (context.prompt_bundle_dir / "system_prompt.txt").read_text(encoding="utf-8")
+
+        self.assertTrue(launcher_path.exists())
+        self.assertIn('exec "', launcher_text)
+        self.assertIn("-m boaresearch.cli", launcher_text)
+        self.assertIn(str(context.tool_context_path), launcher_text)
+        self.assertIn(str(launcher_path), planning_prompt)
+
+    def test_task_prompts_include_explicit_boa_output_paths(self) -> None:
+        repo = _make_repo()
+        planning_context = _planning_context(repo)
+        execution_context = _execution_context(repo)
+
+        planning_task = build_planning_task(planning_context)
+        execution_task = build_execution_task(execution_context)
+
+        self.assertIn(str(planning_context.plan_output_path), planning_task)
+        self.assertIn("Do not scan `.boa/`", planning_task)
+        self.assertIn(str(execution_context.plan_output_path), execution_task)
+        self.assertIn(str(execution_context.candidate_output_path), execution_task)
+        self.assertIn("Do not scan `.boa/`", execution_task)
+
     def test_codex_plan_trial_uses_exec_mode_with_schema_output(self) -> None:
         repo = _make_repo()
         context = _planning_context(repo)
@@ -139,10 +210,9 @@ class CliAgentTests(unittest.TestCase):
             agent.plan_trial(context)
         command = run_mock.call_args.args[0]
         self.assertEqual(command[:3], ["codex", "exec", "-"])
-        self.assertIn("--output-schema", command)
+        self.assertIn("--sandbox", command)
+        self.assertIn("workspace-write", command)
         self.assertIn("--output-last-message", command)
-        self.assertIn("--ask-for-approval", command)
-        self.assertIn("never", command)
         self.assertIn("-p", command)
         self.assertIn("test-profile", command)
         self.assertIn("-m", command)
@@ -242,6 +312,34 @@ class CliAgentTests(unittest.TestCase):
         self.assertEqual(command[0], "custom-runner")
         self.assertEqual(command[1:5], ["--trial", "demo-0001", "--out", str(context.plan_output_path)])
         self.assertEqual(env["BOA_TEST_MARKER"], "planning:demo-0001")
+
+    def test_cli_agent_streams_live_output_when_observer_is_present(self) -> None:
+        repo = _make_repo()
+        context = _planning_context(repo)
+        observer = RecordingObserver()
+        agent = CliResearchAgent(
+            repo_root=repo,
+            agent_config=AgentConfig(
+                preset="custom",
+                runtime="cli",
+                command="python3",
+                args=[
+                    "-c",
+                    (
+                        "print('agent-live'); "
+                        "print('{{\"hypothesis\":\"h\",\"rationale_summary\":\"r\",\"selected_parent_branch\":\"boa/demo/accepted\","
+                        "\"patch_category\":\"optimizer\",\"operation_type\":\"replace\",\"estimated_risk\":0.2,"
+                        "\"informed_by_call_ids\":[\"boa-call-5\"]}}')"
+                    ),
+                ],
+            ),
+            observer=observer,
+        )
+
+        plan = agent.plan_trial(context)
+
+        self.assertEqual(plan.patch_category, "optimizer")
+        self.assertTrue(any(event.kind == "process_output" and event.message == "agent-live" for event in observer.events))
 
 
 class DeepAgentsTests(unittest.TestCase):

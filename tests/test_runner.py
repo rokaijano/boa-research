@@ -14,8 +14,17 @@ from boaresearch.init import (
     write_contract_files,
 )
 from boaresearch.loader import load_config
+from boaresearch.runtime.observer import RunEvent
 from boaresearch.runner import LocalTrialRunner, SSHTrialRunner
 from boaresearch.schema import LocalRunnerConfig, MetricConfig, RunnerStageConfig, SSHRunnerConfig
+
+
+class RecordingObserver:
+    def __init__(self) -> None:
+        self.events: list[RunEvent] = []
+
+    def emit(self, event: RunEvent) -> None:
+        self.events.append(event)
 
 
 class RunnerTests(unittest.TestCase):
@@ -52,6 +61,25 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("timeout 1200", script)
         self.assertIn("reports/metrics.json", script)
         self.assertEqual(remote_stage_dir, ".boa/remote/demo-0001/scout")
+
+    def test_local_runner_streams_output_to_observer(self) -> None:
+        repo = Path(tempfile.mkdtemp())
+        observer = RecordingObserver()
+        runner = LocalTrialRunner(LocalRunnerConfig(), observer=observer)
+
+        execution = runner.run_stage(
+            trial_id="demo-0001",
+            branch_name="boa/demo/trial/demo-0001",
+            worktree_path=repo,
+            stage_name="scout",
+            stage=RunnerStageConfig(commands=['python3 -c "print(\'runner-live\'); print(\'accuracy=0.77\')"'], timeout_seconds=30),
+            metrics=[MetricConfig(name="accuracy", source="regex", pattern=r"accuracy=([0-9.]+)")],
+            artifact_dir=repo / ".artifacts",
+        )
+
+        self.assertEqual(execution.status, "succeeded")
+        self.assertAlmostEqual(execution.metrics["accuracy"], 0.77)
+        self.assertTrue(any(event.kind == "process_output" and event.message == "runner-live" for event in observer.events))
 
     def test_init_written_config_is_loadable_and_validatable(self) -> None:
         repo = Path(tempfile.mkdtemp())

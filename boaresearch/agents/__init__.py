@@ -8,6 +8,7 @@ def build_agent(
     *,
     repo_root,
     run_preflight,
+    observer=None,
 ) -> BaseResearchAgent:
     runtime = str(config.agent.runtime).strip().lower()
     if runtime == "deepagents":
@@ -22,7 +23,7 @@ def build_agent(
     if runtime == "cli":
         from .cli import CliResearchAgent
 
-        return CliResearchAgent(repo_root=repo_root, agent_config=config.agent)
+        return CliResearchAgent(repo_root=repo_root, agent_config=config.agent, observer=observer)
     raise ValueError(f"Unsupported agent.runtime: {config.agent.runtime}")
 
 

@@ -5,9 +5,12 @@ import logging
 import sys
 from pathlib import Path
 
+from .git_state import GitError
 from .init import InitWizard
 from .loader import load_config
 from .runtime import BoaController
+from .runtime.monitor import build_run_observer
+from .runtime.controller import ControllerStateError, RunSummary
 from .runtime.tools import TOOL_COMMANDS, run_tools_command
 
 
@@ -49,6 +52,30 @@ def parse_args() -> argparse.Namespace:
     return build_parser().parse_args()
 
 
+def _format_run_summary(summary: RunSummary) -> str:
+    if summary.stop_requested:
+        if summary.last_trial_id:
+            return f"BOA run stopped after {summary.trials_attempted} trial(s). Last trial: {summary.last_trial_id} ({summary.last_acceptance_status or 'unknown'})."
+        return "BOA run stopped before starting a new trial."
+    if summary.last_trial_id is None:
+        return "BOA run completed without creating a trial."
+    parts = [
+        f"BOA run completed. Last trial: {summary.last_trial_id}",
+        f"status={summary.last_acceptance_status or 'unknown'}",
+    ]
+    if summary.last_canonical_stage:
+        parts.append(f"stage={summary.last_canonical_stage}")
+    if summary.last_canonical_score is not None:
+        parts.append(f"score={summary.last_canonical_score:.6f}")
+    parts.append(f"trials_attempted={summary.trials_attempted}")
+    if summary.last_detail:
+        detail = " ".join(summary.last_detail.split())
+        if len(detail) > 220:
+            detail = detail[:217].rstrip() + "..."
+        parts.append(f"detail={detail}")
+    return " | ".join(parts)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
     args = parse_args()
@@ -59,8 +86,14 @@ def main() -> None:
             print("\nBOA init cancelled. Goodbye.", file=sys.stderr)
         return
     if args.command == "run":
-        config = load_config(repo=args.repo, config_path=args.config)
-        BoaController(config).run()
+        try:
+            config = load_config(repo=args.repo, config_path=args.config)
+            with build_run_observer(stream=sys.stderr) as observer:
+                summary = BoaController(config, observer=observer).run()
+            print(_format_run_summary(summary))
+        except (ControllerStateError, GitError) as exc:
+            print(f"BOA run failed: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
         return
     if args.command == "tools":
         run_tools_command(args)

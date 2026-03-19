@@ -32,6 +32,7 @@ This repository packages BOA (Bayesian Optimized Agents) as a reusable Python to
 - The execution CLI is:
   - `boa run`
   - `boa run /path/to/target/repo`
+- On interactive terminals, `boa run` should surface a live BOA-managed run monitor with trial/phase/stage progress, recent log events, and streamed agent or runner output when available. Non-interactive terminals should still receive readable progress logs.
 - The BO oracle CLI is:
   - `boa tools recent-trials`
   - `boa tools list-lineage-options`
@@ -51,6 +52,8 @@ This repository packages BOA (Bayesian Optimized Agents) as a reusable Python to
 The current code uses these BOA-owned paths:
 
 - `.boa/artifacts/trials/<trial_id>/`
+- `.boa/agent_outputs/<trial_id>/`
+- `.boa/agent_traces/<trial_id>/search_calls.jsonl`
 - `.boa/prompts/<trial_id>/`
 - `.boa/store/experiments.sqlite`
 - `.boa/worktrees/<run_tag>/`

@@ -35,7 +35,21 @@ def run_git(
 
 
 def current_branch(repo_path: Path) -> str:
-    return run_git(repo_path, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+    for args in (
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        ["branch", "--show-current"],
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+    ):
+        proc = run_git(repo_path, args, check=False)
+        branch = (proc.stdout or "").strip()
+        if proc.returncode == 0 and branch:
+            return branch
+    return ""
+
+
+def has_commits(repo_path: Path) -> bool:
+    proc = run_git(repo_path, ["rev-parse", "--verify", "HEAD"], check=False)
+    return proc.returncode == 0
 
 
 def current_commit(repo_path: Path) -> str:

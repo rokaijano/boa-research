@@ -1,18 +1,43 @@
 from __future__ import annotations
 
 import os
+import sys
 import subprocess
 from pathlib import Path
 
+from ..process import run_process_with_live_output
 from ..prompt_builder import build_cli_execution_bundle, build_cli_planning_bundle
+from ..runtime.observer import RunEvent
 from ..schema import AgentExecutionContext, AgentPlanningContext, CandidateMetadata, CandidatePlan
 from .base import BaseResearchAgent, ResearchAgentError, extract_json_object, parse_candidate_dict, parse_candidate_plan_dict
 
 
 class CliResearchAgent(BaseResearchAgent):
-    def __init__(self, *, repo_root: Path, agent_config) -> None:
+    def __init__(self, *, repo_root: Path, agent_config, observer=None) -> None:
         self.repo_root = repo_root
         self.agent_config = agent_config
+        self.observer = observer
+
+    def _emit(
+        self,
+        *,
+        kind: str,
+        message: str,
+        trial_id: str,
+        phase: str,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        if self.observer is None:
+            return
+        self.observer.emit(
+            RunEvent(
+                kind=kind,
+                message=message,
+                trial_id=trial_id,
+                phase=phase,
+                metadata=dict(metadata or {}),
+            )
+        )
 
     def _template_values(
         self,
@@ -73,13 +98,15 @@ class CliResearchAgent(BaseResearchAgent):
     def _write_planning_bundle(self, context: AgentPlanningContext) -> dict[str, Path]:
         bundle_root = context.prompt_bundle_dir
         bundle_root.mkdir(parents=True, exist_ok=True)
-        bundle = build_cli_planning_bundle(repo_root=self.repo_root, context=context)
+        tool_command = self._write_tool_launcher(bundle_root=bundle_root, tool_context_path=context.tool_context_path)
+        bundle = build_cli_planning_bundle(repo_root=self.repo_root, context=context, tool_command=str(tool_command))
         paths = {
             "system_prompt": bundle_root / "system_prompt.txt",
             "task_prompt": bundle_root / "task_prompt.txt",
             "prompt": bundle_root / "combined_prompt.txt",
             "plan_schema": bundle_root / "plan_schema.json",
             "plan_example": bundle_root / "plan_example.json",
+            "tool_launcher": tool_command,
             "stdout": bundle_root / "last_stdout.txt",
             "stderr": bundle_root / "last_stderr.txt",
         }
@@ -95,13 +122,15 @@ class CliResearchAgent(BaseResearchAgent):
     def _write_execution_bundle(self, context: AgentExecutionContext) -> dict[str, Path]:
         bundle_root = context.prompt_bundle_dir
         bundle_root.mkdir(parents=True, exist_ok=True)
-        bundle = build_cli_execution_bundle(repo_root=self.repo_root, context=context)
+        tool_command = self._write_tool_launcher(bundle_root=bundle_root, tool_context_path=context.tool_context_path)
+        bundle = build_cli_execution_bundle(repo_root=self.repo_root, context=context, tool_command=str(tool_command))
         paths = {
             "system_prompt": bundle_root / "system_prompt.txt",
             "task_prompt": bundle_root / "task_prompt.txt",
             "prompt": bundle_root / "combined_prompt.txt",
             "candidate_schema": bundle_root / "candidate_schema.json",
             "candidate_example": bundle_root / "candidate_example.json",
+            "tool_launcher": tool_command,
             "stdout": bundle_root / "last_stdout.txt",
             "stderr": bundle_root / "last_stderr.txt",
         }
@@ -114,23 +143,84 @@ class CliResearchAgent(BaseResearchAgent):
             context.candidate_output_path.unlink()
         return paths
 
-    def _run_cli(self, *, phase: str, cwd: Path, prompt_path: Path, template_values: dict[str, str], extra_env: dict[str, str], stdout_path: Path, stderr_path: Path) -> str:
+    def _write_tool_launcher(self, *, bundle_root: Path, tool_context_path: Path) -> Path:
+        launcher_path = bundle_root / "boa-tools"
+        pythonpath_entries = [str(self.repo_root)]
+        existing_pythonpath = os.environ.get("PYTHONPATH")
+        if existing_pythonpath:
+            pythonpath_entries.append(existing_pythonpath)
+        launcher_path.write_text(
+            "\n".join(
+                [
+                    "#!/bin/sh",
+                    "set -eu",
+                    f'export BOA_TOOL_CONTEXT_PATH="{tool_context_path}"',
+                    f'export PYTHONPATH="{":".join(pythonpath_entries)}"',
+                    f'exec "{sys.executable}" -m boaresearch.cli "$@"',
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        launcher_path.chmod(0o755)
+        return launcher_path
+
+    def _run_cli(
+        self,
+        *,
+        trial_id: str,
+        phase: str,
+        cwd: Path,
+        prompt_path: Path,
+        template_values: dict[str, str],
+        extra_env: dict[str, str],
+        stdout_path: Path,
+        stderr_path: Path,
+    ) -> str:
         command = self._build_command(template_values)
         env = os.environ.copy()
         env.update({key: self._render_template(value, template_values) for key, value in dict(self.agent_config.env).items()})
         env.update(extra_env)
         prompt_text = prompt_path.read_text(encoding="utf-8")
+        self._emit(
+            kind="agent_prompt_sent",
+            message=f"Sending {phase} prompt to {self.agent_config.preset}",
+            trial_id=trial_id,
+            phase=phase,
+        )
+        self._emit(
+            kind="agent_command_started",
+            message=f"Waiting for {self.agent_config.preset} {phase} response",
+            trial_id=trial_id,
+            phase=phase,
+            metadata={"command": command},
+        )
         try:
-            proc = subprocess.run(
-                command,
-                cwd=str(cwd),
-                input=prompt_text,
-                capture_output=True,
-                text=True,
-                timeout=int(self.agent_config.prepare_timeout_seconds),
-                check=False,
-                env=env,
-            )
+            if self.observer is None:
+                proc = subprocess.run(
+                    command,
+                    cwd=str(cwd),
+                    input=prompt_text,
+                    capture_output=True,
+                    text=True,
+                    timeout=int(self.agent_config.prepare_timeout_seconds),
+                    check=False,
+                    env=env,
+                )
+            else:
+                proc = run_process_with_live_output(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    input_text=prompt_text,
+                    timeout_seconds=int(self.agent_config.prepare_timeout_seconds),
+                    observer=self.observer,
+                    trial_id=trial_id,
+                    phase=phase,
+                    stage_name=None,
+                    stdout_source="agent.stdout",
+                    stderr_source="agent.stderr",
+                )
         except FileNotFoundError as exc:
             raise ResearchAgentError(f"CLI agent command not found: {command[0]}") from exc
         except subprocess.TimeoutExpired as exc:
@@ -139,6 +229,13 @@ class CliResearchAgent(BaseResearchAgent):
             ) from exc
         stdout_path.write_text(proc.stdout or "", encoding="utf-8")
         stderr_path.write_text(proc.stderr or "", encoding="utf-8")
+        self._emit(
+            kind="agent_command_completed",
+            message=f"{self.agent_config.preset} {phase} finished with exit code {proc.returncode}",
+            trial_id=trial_id,
+            phase=phase,
+            metadata={"returncode": proc.returncode},
+        )
         if proc.returncode != 0:
             stdout_tail = self._tail(proc.stdout)
             stderr_tail = self._tail(proc.stderr)
@@ -152,11 +249,11 @@ class CliResearchAgent(BaseResearchAgent):
     def _run_codex_exec(
         self,
         *,
+        trial_id: str,
         phase: str,
         cwd: Path,
         prompt_path: Path,
         output_path: Path,
-        schema_path: Path,
         template_values: dict[str, str],
         extra_env: dict[str, str],
         stdout_path: Path,
@@ -170,10 +267,6 @@ class CliResearchAgent(BaseResearchAgent):
             "never",
             "--sandbox",
             "workspace-write",
-            "--ask-for-approval",
-            "never",
-            "--output-schema",
-            str(schema_path),
             "--output-last-message",
             str(output_path),
             "-C",
@@ -187,17 +280,45 @@ class CliResearchAgent(BaseResearchAgent):
         env.update({key: self._render_template(value, template_values) for key, value in dict(self.agent_config.env).items()})
         env.update(extra_env)
         prompt_text = prompt_path.read_text(encoding="utf-8")
+        self._emit(
+            kind="agent_prompt_sent",
+            message=f"Sending {phase} prompt to {self.agent_config.preset}",
+            trial_id=trial_id,
+            phase=phase,
+        )
+        self._emit(
+            kind="agent_command_started",
+            message=f"Waiting for {self.agent_config.preset} {phase} response",
+            trial_id=trial_id,
+            phase=phase,
+            metadata={"command": command},
+        )
         try:
-            proc = subprocess.run(
-                command,
-                cwd=str(cwd),
-                input=prompt_text,
-                capture_output=True,
-                text=True,
-                timeout=int(self.agent_config.prepare_timeout_seconds),
-                check=False,
-                env=env,
-            )
+            if self.observer is None:
+                proc = subprocess.run(
+                    command,
+                    cwd=str(cwd),
+                    input=prompt_text,
+                    capture_output=True,
+                    text=True,
+                    timeout=int(self.agent_config.prepare_timeout_seconds),
+                    check=False,
+                    env=env,
+                )
+            else:
+                proc = run_process_with_live_output(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    input_text=prompt_text,
+                    timeout_seconds=int(self.agent_config.prepare_timeout_seconds),
+                    observer=self.observer,
+                    trial_id=trial_id,
+                    phase=phase,
+                    stage_name=None,
+                    stdout_source="agent.stdout",
+                    stderr_source="agent.stderr",
+                )
         except FileNotFoundError as exc:
             raise ResearchAgentError(f"CLI agent command not found: {command[0]}") from exc
         except subprocess.TimeoutExpired as exc:
@@ -206,6 +327,13 @@ class CliResearchAgent(BaseResearchAgent):
             ) from exc
         stdout_path.write_text(proc.stdout or "", encoding="utf-8")
         stderr_path.write_text(proc.stderr or "", encoding="utf-8")
+        self._emit(
+            kind="agent_command_completed",
+            message=f"{self.agent_config.preset} {phase} finished with exit code {proc.returncode}",
+            trial_id=trial_id,
+            phase=phase,
+            metadata={"returncode": proc.returncode},
+        )
         if proc.returncode != 0:
             stdout_tail = self._tail(proc.stdout)
             stderr_tail = self._tail(proc.stderr)
@@ -232,6 +360,13 @@ class CliResearchAgent(BaseResearchAgent):
 
     def plan_trial(self, context: AgentPlanningContext) -> CandidatePlan:
         bundle_paths = self._write_planning_bundle(context)
+        self._emit(
+            kind="planning_bundle_ready",
+            message="Planning prompt prepared: inspect accepted workspace, choose a BOA parent, and explain the proposed patch.",
+            trial_id=context.trial_id,
+            phase="planning",
+            metadata={"prompt_dir": str(context.prompt_bundle_dir)},
+        )
         template_values = self._template_values(
             phase="planning",
             trial_id=context.trial_id,
@@ -259,11 +394,11 @@ class CliResearchAgent(BaseResearchAgent):
         }
         if self._is_codex_exec_adapter(template_values):
             stdout = self._run_codex_exec(
+                trial_id=context.trial_id,
                 phase="planning",
                 cwd=context.worktree_path,
                 prompt_path=bundle_paths["prompt"],
                 output_path=context.plan_output_path,
-                schema_path=bundle_paths["plan_schema"],
                 template_values=template_values,
                 extra_env=env,
                 stdout_path=bundle_paths["stdout"],
@@ -271,6 +406,7 @@ class CliResearchAgent(BaseResearchAgent):
             )
         else:
             stdout = self._run_cli(
+                trial_id=context.trial_id,
                 phase="planning",
                 cwd=context.worktree_path,
                 prompt_path=bundle_paths["prompt"],
@@ -280,15 +416,36 @@ class CliResearchAgent(BaseResearchAgent):
                 stderr_path=bundle_paths["stderr"],
             )
         try:
-            return self._parse_plan(plan_path=context.plan_output_path, stdout=stdout)
+            plan = self._parse_plan(plan_path=context.plan_output_path, stdout=stdout)
         except ResearchAgentError as exc:
             raise ResearchAgentError(
                 f"CLI agent '{self.agent_config.preset}' did not return a valid candidate plan.\n"
                 f"stdout:\n{self._tail(stdout) or '<empty>'}"
             ) from exc
+        summary_parts = [
+            f"Plan ready: {plan.patch_category}/{plan.operation_type}",
+            f"parent={plan.selected_parent_branch}",
+            f"risk={plan.estimated_risk:.2f}",
+        ]
+        if plan.target_symbols:
+            summary_parts.append(f"targets={', '.join(plan.target_symbols[:3])}")
+        self._emit(
+            kind="planning_result",
+            message=" | ".join(summary_parts),
+            trial_id=context.trial_id,
+            phase="planning",
+        )
+        return plan
 
     def prepare_candidate(self, context: AgentExecutionContext) -> CandidateMetadata:
         bundle_paths = self._write_execution_bundle(context)
+        self._emit(
+            kind="execution_bundle_ready",
+            message="Execution prompt prepared: apply the patch in the trial worktree, obey guardrails, and emit candidate metadata.",
+            trial_id=context.trial_id,
+            phase="execution",
+            metadata={"prompt_dir": str(context.prompt_bundle_dir)},
+        )
         template_values = self._template_values(
             phase="execution",
             trial_id=context.trial_id,
@@ -317,11 +474,11 @@ class CliResearchAgent(BaseResearchAgent):
         }
         if self._is_codex_exec_adapter(template_values):
             stdout = self._run_codex_exec(
+                trial_id=context.trial_id,
                 phase="execution",
                 cwd=context.worktree_path,
                 prompt_path=bundle_paths["prompt"],
                 output_path=context.candidate_output_path,
-                schema_path=bundle_paths["candidate_schema"],
                 template_values=template_values,
                 extra_env=env,
                 stdout_path=bundle_paths["stdout"],
@@ -329,6 +486,7 @@ class CliResearchAgent(BaseResearchAgent):
             )
         else:
             stdout = self._run_cli(
+                trial_id=context.trial_id,
                 phase="execution",
                 cwd=context.worktree_path,
                 prompt_path=bundle_paths["prompt"],
@@ -338,9 +496,23 @@ class CliResearchAgent(BaseResearchAgent):
                 stderr_path=bundle_paths["stderr"],
             )
         try:
-            return self._parse_candidate(candidate_path=context.candidate_output_path, stdout=stdout)
+            candidate = self._parse_candidate(candidate_path=context.candidate_output_path, stdout=stdout)
         except ResearchAgentError as exc:
             raise ResearchAgentError(
                 f"CLI agent '{self.agent_config.preset}' did not return valid candidate metadata.\n"
                 f"stdout:\n{self._tail(stdout) or '<empty>'}"
             ) from exc
+        summary_parts = [
+            f"Candidate ready: {candidate.patch_category}/{candidate.operation_type}",
+            f"risk={candidate.estimated_risk:.2f}",
+        ]
+        if candidate.numeric_knobs:
+            first_knob = next(iter(candidate.numeric_knobs.items()))
+            summary_parts.append(f"knob={first_knob[0]}={first_knob[1]}")
+        self._emit(
+            kind="execution_result",
+            message=" | ".join(summary_parts),
+            trial_id=context.trial_id,
+            phase="execution",
+        )
+        return candidate

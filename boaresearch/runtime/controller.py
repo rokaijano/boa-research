@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .. import git_state
@@ -13,6 +14,7 @@ from ..descriptors import build_patch_descriptor
 from ..git_auth import GitAuthManager
 from ..loader import enabled_stages
 from .paths import BoaPaths
+from .observer import NullRunObserver, RunEvent
 from ..runner import RunnerError, build_trial_runner
 from ..schema import (
     AgentExecutionContext,
@@ -33,15 +35,31 @@ class PolicyRejectedError(RuntimeError):
     pass
 
 
+class ControllerStateError(RuntimeError):
+    pass
+
+
+@dataclass
+class RunSummary:
+    trials_attempted: int
+    stop_requested: bool
+    last_trial_id: str | None
+    last_acceptance_status: str | None
+    last_canonical_stage: str | None
+    last_canonical_score: float | None
+    last_detail: str | None
+
+
 class BoaController:
-    def __init__(self, config: BoaConfig) -> None:
+    def __init__(self, config: BoaConfig, *, observer=None) -> None:
         self.config = config
+        self.observer = observer or NullRunObserver()
         self.paths = BoaPaths.from_config(config)
         helper_root = self.paths.runtime_root / "git_auth_helpers"
         self.git_auth = GitAuthManager(config.git_auth, helper_root=helper_root)
         self.store = ExperimentStore(self.paths.store_path)
         self.acceptance = AcceptanceEngine(config)
-        self.runner = build_trial_runner(config, git_auth=self.git_auth)
+        self.runner = build_trial_runner(config, git_auth=self.git_auth, observer=self.observer)
         self.worktree = WorktreeManager(
             repo_root=config.repo_root,
             worktree_path=config.run.worktree_path or (config.repo_root / ".boa" / "worktrees" / config.run.tag),
@@ -52,6 +70,28 @@ class BoaController:
             config,
             repo_root=config.repo_root,
             run_preflight=self._run_preflight,
+            observer=self.observer,
+        )
+
+    def _emit(
+        self,
+        *,
+        kind: str,
+        message: str,
+        trial_id: str | None = None,
+        phase: str | None = None,
+        stage_name: str | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        self.observer.emit(
+            RunEvent(
+                kind=kind,
+                message=message,
+                trial_id=trial_id,
+                phase=phase,
+                stage_name=stage_name,
+                metadata=dict(metadata or {}),
+            )
         )
 
     def _objective_summary(self) -> str:
@@ -76,13 +116,28 @@ class BoaController:
 
     def _run_preflight(self) -> None:
         for command in self.config.guardrails.preflight_commands:
+            self._emit(
+                kind="preflight_started",
+                message="Running preflight checks",
+            )
             self._run_command(command=command, cwd=self.worktree.worktree_path)
+            self._emit(
+                kind="preflight_completed",
+                message="Preflight checks completed",
+            )
 
     def _ensure_ready(self) -> None:
         self.paths.ensure()
         self.store.ensure_schema()
         if self.config.run.base_branch is None:
             self.config.run.base_branch = git_state.current_branch(self.config.repo_root)
+        if not git_state.has_commits(self.config.repo_root):
+            branch = str(self.config.run.base_branch or "HEAD")
+            raise ControllerStateError(
+                f"BOA run requires at least one commit in the target repository. "
+                f"The current branch is '{branch}', but HEAD does not point to a commit yet. "
+                "Create an initial commit and rerun `boa run`."
+            )
         self.worktree.ensure_accepted_branch(base_branch=str(self.config.run.base_branch))
         if self.runner.requires_remote_branches:
             self.worktree.push_branch(
@@ -104,12 +159,25 @@ class BoaController:
         return path
 
     def _search_trace_path(self, trial_id: str) -> Path:
-        return self._trial_artifact_dir(trial_id) / "search_calls.jsonl"
+        path = self.worktree.worktree_path / ".boa" / "agent_traces" / trial_id / "search_calls.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _agent_output_dir(self, trial_id: str) -> Path:
+        path = self.worktree.worktree_path / ".boa" / "agent_outputs" / trial_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     def _plan_output_path(self, trial_id: str) -> Path:
-        return self._trial_artifact_dir(trial_id) / "plan.json"
+        return self._agent_output_dir(trial_id) / "plan.json"
 
     def _candidate_output_path(self, trial_id: str) -> Path:
+        return self._agent_output_dir(trial_id) / "candidate.json"
+
+    def _artifact_plan_path(self, trial_id: str) -> Path:
+        return self._trial_artifact_dir(trial_id) / "plan.json"
+
+    def _artifact_candidate_path(self, trial_id: str) -> Path:
         return self._trial_artifact_dir(trial_id) / "candidate.json"
 
     def _prompt_bundle_dir(self, trial_id: str, *, phase: str) -> Path:
@@ -209,9 +277,74 @@ class BoaController:
     def _stage_config(self, stage_name: str):
         return getattr(self.config.runner, stage_name)
 
+    def _baseline_failure_status(self, execution_status: str) -> str:
+        if execution_status == "timeout":
+            return "timed_out"
+        if execution_status == "metric_missing":
+            return "metric_missing"
+        return "stage_failed"
+
+    def _execution_failure_detail(self, execution) -> str:
+        for command_result in execution.command_results:
+            if command_result.status == "ok":
+                continue
+            detail = f" Failing command: {command_result.command}."
+            stderr_text = ""
+            if command_result.stderr_path.exists():
+                stderr_text = command_result.stderr_path.read_text(encoding="utf-8", errors="replace").strip()
+            elif command_result.stdout_path.exists():
+                stderr_text = command_result.stdout_path.read_text(encoding="utf-8", errors="replace").strip()
+            if stderr_text:
+                last_line = stderr_text.splitlines()[-1].strip()
+                if last_line:
+                    detail += f" Detail: {last_line}"
+            return detail
+        return ""
+
+    def _record_baseline_stage_result(
+        self,
+        *,
+        trial_id: str,
+        stage_name: str,
+        execution,
+        acceptance_status: str,
+        reason: str,
+    ) -> None:
+        stage_result = StageRunResult(
+            stage_name=stage_name,
+            branch_name=str(self.config.run.accepted_branch),
+            status=execution.status,
+            command_results=execution.command_results,
+            metrics=execution.metrics,
+            primary_metric=None,
+            cost_metric=None,
+            adjusted_score=None,
+            threshold_passed=False,
+            improved=False,
+            advanced=False,
+            final_accept=False,
+            reason=reason,
+            started_at=execution.started_at,
+            completed_at=execution.completed_at,
+            resource_metadata=execution.resource_metadata,
+            artifact_dir=execution.artifact_dir,
+        )
+        self.store.record_stage_result(trial_id=trial_id, result=stage_result)
+        self.store.set_acceptance(
+            trial_id=trial_id,
+            acceptance_status=acceptance_status,
+            canonical_stage=None,
+            canonical_score=None,
+        )
+
     def _seed_baseline(self, stage_name: str) -> None:
         if self.store.get_incumbent(stage_name) is not None:
             return
+        self._emit(
+            kind="baseline_started",
+            message=f"Seeding accepted-branch baseline for stage '{stage_name}'",
+            stage_name=stage_name,
+        )
         trial_id = f"{self.config.run.tag}-baseline-{stage_name}"
         artifact_dir = self._trial_artifact_dir(trial_id)
         if not self.runner.requires_remote_branches:
@@ -219,19 +352,20 @@ class BoaController:
                 trial_branch=str(self.config.run.accepted_branch),
                 parent_branch=str(self.config.run.accepted_branch),
             )
-        self.store.create_trial(
-            run_tag=self.config.run.tag,
-            trial_id=trial_id,
-            branch_name=str(self.config.run.accepted_branch),
-            parent_branch=str(self.config.run.accepted_branch),
-            parent_trial_id=None,
-            candidate_plan=None,
-            candidate=None,
-            descriptor=None,
-            search_trace=[],
-            diff_path=None,
-            acceptance_status="baseline",
-        )
+        if not self.store.has_trial(trial_id):
+            self.store.create_trial(
+                run_tag=self.config.run.tag,
+                trial_id=trial_id,
+                branch_name=str(self.config.run.accepted_branch),
+                parent_branch=str(self.config.run.accepted_branch),
+                parent_trial_id=None,
+                candidate_plan=None,
+                candidate=None,
+                descriptor=None,
+                search_trace=[],
+                diff_path=None,
+                acceptance_status="baseline",
+            )
         execution = self.runner.run_stage(
             trial_id=trial_id,
             branch_name=str(self.config.run.accepted_branch),
@@ -241,7 +375,34 @@ class BoaController:
             metrics=self.config.metrics,
             artifact_dir=artifact_dir,
         )
-        evaluation = self.acceptance.evaluate_stage(stage_name=stage_name, metrics=execution.metrics, incumbent=None)
+        if execution.status != "succeeded":
+            acceptance_status = self._baseline_failure_status(execution.status)
+            self._record_baseline_stage_result(
+                trial_id=trial_id,
+                stage_name=stage_name,
+                execution=execution,
+                acceptance_status=acceptance_status,
+                reason=execution.status,
+            )
+            raise ControllerStateError(
+                f"Accepted-branch baseline failed at stage '{stage_name}' with status '{acceptance_status}'. "
+                "BOA cannot continue until the configured stage commands and metric extraction work on the current accepted branch."
+                f"{self._execution_failure_detail(execution)}"
+            )
+        try:
+            evaluation = self.acceptance.evaluate_stage(stage_name=stage_name, metrics=execution.metrics, incumbent=None)
+        except ValueError as exc:
+            self._record_baseline_stage_result(
+                trial_id=trial_id,
+                stage_name=stage_name,
+                execution=execution,
+                acceptance_status="metric_missing",
+                reason=str(exc),
+            )
+            raise ControllerStateError(
+                f"Accepted-branch baseline is missing required metrics at stage '{stage_name}': {exc}. "
+                "BOA cannot continue until the eval command and metric extraction are aligned with boa.config."
+            ) from exc
         stage_result = StageRunResult(
             stage_name=stage_name,
             branch_name=str(self.config.run.accepted_branch),
@@ -275,9 +436,16 @@ class BoaController:
             canonical_stage=stage_name,
             canonical_score=evaluation.adjusted_score,
         )
+        self._emit(
+            kind="baseline_completed",
+            message=f"Baseline ready for stage '{stage_name}'",
+            trial_id=trial_id,
+            stage_name=stage_name,
+            metadata={"score": evaluation.adjusted_score},
+        )
 
     def _write_plan_artifact(self, *, trial_id: str, candidate_plan: CandidatePlan) -> None:
-        self._plan_output_path(trial_id).write_text(
+        self._artifact_plan_path(trial_id).write_text(
             json.dumps(asdict(candidate_plan), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
@@ -299,7 +467,7 @@ class BoaController:
         self._run_preflight()
         diff_text = self.worktree.diff_text(base_ref=parent_branch)
         artifact_dir = self._trial_artifact_dir(trial_id)
-        candidate_path = self._candidate_output_path(trial_id)
+        candidate_path = self._artifact_candidate_path(trial_id)
         candidate_path.write_text(json.dumps(asdict(candidate), indent=2, sort_keys=True) + "\n", encoding="utf-8")
         diff_path = artifact_dir / "patch.diff"
         diff_path.write_text(diff_text, encoding="utf-8")
@@ -312,6 +480,21 @@ class BoaController:
             budget_used="scout",
             diff_path=diff_path,
         )
+        knob_summary = ""
+        if descriptor.numeric_knobs:
+            first_knob = next(iter(descriptor.numeric_knobs.items()))
+            knob_summary = f" | knob={first_knob[0]}={first_knob[1]}"
+        self._emit(
+            kind="descriptor_ready",
+            message=(
+                f"Patch ready: files={len(descriptor.touched_files)}"
+                f" | symbols={len(descriptor.touched_symbols)}"
+                f" | family={descriptor.patch_category}/{descriptor.operation_type}"
+                f"{knob_summary}"
+            ),
+            trial_id=trial_id,
+            phase="execution",
+        )
         return artifact_dir, diff_path, descriptor
 
     @staticmethod
@@ -319,6 +502,11 @@ class BoaController:
         known = {item.call_id for item in trace}
         unknown = [call_id for call_id in call_ids if call_id not in known]
         if unknown:
+            if not known:
+                raise PolicyRejectedError(
+                    "Agent cited BOA tool call ids, but BOA recorded no tool calls for this trial. "
+                    "The planning or execution step likely hallucinated call ids instead of invoking `boa tools`."
+                )
             raise PolicyRejectedError(f"Unknown BOA tool call ids referenced: {', '.join(unknown)}")
 
     def _validate_parent(self, *, candidate_plan: CandidatePlan, oracle: SearchOracleService) -> tuple[str, str | None]:
@@ -344,6 +532,13 @@ class BoaController:
         final_accept = False
         highest_stage = self.acceptance.highest_enabled_stage()
         for stage_name in enabled_stages(self.config):
+            self._emit(
+                kind="stage_started",
+                message=f"Starting evaluation stage '{stage_name}'",
+                trial_id=trial_id,
+                phase="evaluation",
+                stage_name=stage_name,
+            )
             execution = self.runner.run_stage(
                 trial_id=trial_id,
                 branch_name=trial_branch,
@@ -374,6 +569,14 @@ class BoaController:
                     artifact_dir=execution.artifact_dir,
                 )
                 self.store.record_stage_result(trial_id=trial_id, result=stage_result)
+                self._emit(
+                    kind="stage_failed",
+                    message=f"Stage '{stage_name}' finished with status {execution.status}",
+                    trial_id=trial_id,
+                    phase="evaluation",
+                    stage_name=stage_name,
+                    metadata={"status": execution.status},
+                )
                 if execution.status == "timeout":
                     return "timed_out", canonical_stage, canonical_score
                 if execution.status == "metric_missing":
@@ -408,6 +611,18 @@ class BoaController:
             canonical_stage = stage_name
             canonical_score = evaluation.adjusted_score
             final_accept = evaluation.final_accept
+            self._emit(
+                kind="stage_completed",
+                message=(
+                    f"Stage '{stage_name}' completed"
+                    f" | score={evaluation.adjusted_score:.6f}"
+                    f" | {self.config.objective.primary_metric}={evaluation.primary_metric:.6f}"
+                ),
+                trial_id=trial_id,
+                phase="evaluation",
+                stage_name=stage_name,
+                metadata={"score": evaluation.adjusted_score, "advanced": evaluation.advanced},
+            )
             if evaluation.improved:
                 self.store.upsert_incumbent(
                     stage_name=stage_name,
@@ -441,6 +656,29 @@ class BoaController:
         if "timed out" in lowered:
             return "timed_out"
         return "stage_failed"
+
+    @staticmethod
+    def _summarize_exception_detail(exc: Exception) -> str | None:
+        text = str(exc).strip()
+        if not text:
+            return None
+        message_match = re.search(r'"message":\s*"((?:\\.|[^"])*)"', text, flags=re.DOTALL)
+        if message_match:
+            message = bytes(message_match.group(1), "utf-8").decode("unicode_escape")
+            return " ".join(message.split())
+        detail_match = re.search(r"Detail:\s*(.+)", text, flags=re.DOTALL)
+        if detail_match:
+            detail = detail_match.group(1).strip()
+            if detail:
+                return " ".join(detail.split())
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for line in reversed(lines):
+            if line.lower() in {"stdout:", "stderr:", "<empty>"}:
+                continue
+            if line.startswith("```"):
+                continue
+            return " ".join(line.split())
+        return None
 
     def _record_failed_trial(
         self,
@@ -483,12 +721,34 @@ class BoaController:
             acceptance_status=acceptance_status,
         )
 
-    def run(self) -> None:
+    def run(self) -> RunSummary:
+        self._emit(
+            kind="run_started",
+            message=f"Starting BOA run for tag '{self.config.run.tag}'",
+        )
         self._ensure_ready()
         consecutive_failures = 0
+        trials_attempted = 0
+        last_trial_id: str | None = None
+        last_acceptance_status: str | None = None
+        last_canonical_stage: str | None = None
+        last_canonical_score: float | None = None
+        last_detail: str | None = None
         for _ in range(int(self.config.run.max_trials)):
             if self.paths.stop_file.exists():
-                return
+                self._emit(
+                    kind="run_stopped",
+                    message="Stop file detected. Ending BOA run.",
+                )
+                return RunSummary(
+                    trials_attempted=trials_attempted,
+                    stop_requested=True,
+                    last_trial_id=last_trial_id,
+                    last_acceptance_status=last_acceptance_status,
+                    last_canonical_stage=last_canonical_stage,
+                    last_canonical_score=last_canonical_score,
+                    last_detail=None,
+                )
             for stage_name in enabled_stages(self.config):
                 self._seed_baseline(stage_name)
             recent_trials = self._recent_trials()
@@ -501,10 +761,30 @@ class BoaController:
             candidate: CandidateMetadata | None = None
             descriptor = None
             diff_path: Path | None = None
+            trials_attempted += 1
+            last_trial_id = trial_id
+            self._emit(
+                kind="trial_started",
+                message=f"Starting trial {trial_id}",
+                trial_id=trial_id,
+            )
             try:
                 self._prepare_planning_workspace()
+                self._emit(
+                    kind="planning_started",
+                    message="Preparing planning phase on accepted branch",
+                    trial_id=trial_id,
+                    phase="planning",
+                )
                 planning_context = self._build_planning_context(trial_id=trial_id, recent_trials=recent_trials)
                 candidate_plan = self.agent.plan_trial(planning_context)
+                self._emit(
+                    kind="planning_completed",
+                    message=f"Planning selected parent branch {candidate_plan.selected_parent_branch}",
+                    trial_id=trial_id,
+                    phase="planning",
+                    metadata={"parent_branch": candidate_plan.selected_parent_branch},
+                )
                 self._write_plan_artifact(trial_id=trial_id, candidate_plan=candidate_plan)
                 self._validate_informed_by_call_ids(
                     candidate_plan.informed_by_call_ids,
@@ -512,6 +792,13 @@ class BoaController:
                 )
                 parent_branch, parent_trial_id = self._validate_parent(candidate_plan=candidate_plan, oracle=oracle)
                 self.worktree.prepare_trial(trial_branch=trial_branch, parent_branch=parent_branch)
+                self._emit(
+                    kind="execution_started",
+                    message=f"Preparing execution worktree from {parent_branch}",
+                    trial_id=trial_id,
+                    phase="execution",
+                    metadata={"parent_branch": parent_branch},
+                )
                 execution_context = self._build_execution_context(
                     trial_id=trial_id,
                     trial_branch=trial_branch,
@@ -521,6 +808,12 @@ class BoaController:
                     candidate_plan=candidate_plan,
                 )
                 candidate = self.agent.prepare_candidate(execution_context)
+                self._emit(
+                    kind="execution_completed",
+                    message="Candidate metadata captured. Validating patch and running stages.",
+                    trial_id=trial_id,
+                    phase="execution",
+                )
                 self._validate_informed_by_call_ids(
                     candidate.informed_by_call_ids,
                     load_search_trace(self._search_trace_path(trial_id)),
@@ -566,9 +859,23 @@ class BoaController:
                     canonical_stage=canonical_stage,
                     canonical_score=canonical_score,
                 )
+                last_acceptance_status = acceptance_status
+                last_canonical_stage = canonical_stage
+                last_canonical_score = canonical_score
+                last_detail = None
                 consecutive_failures = 0
+                self._emit(
+                    kind="trial_completed",
+                    message=f"Trial {trial_id} finished with status {acceptance_status}",
+                    trial_id=trial_id,
+                    metadata={"acceptance_status": acceptance_status},
+                )
             except PolicyRejectedError as exc:
                 consecutive_failures += 1
+                last_acceptance_status = "policy_rejected"
+                last_canonical_stage = None
+                last_canonical_score = None
+                last_detail = self._summarize_exception_detail(exc)
                 self._record_failed_trial(
                     trial_id=trial_id,
                     trial_branch=trial_branch,
@@ -581,10 +888,20 @@ class BoaController:
                     acceptance_status="policy_rejected",
                     exc=exc,
                 )
+                self._emit(
+                    kind="trial_failed",
+                    message=f"Trial {trial_id} was policy rejected",
+                    trial_id=trial_id,
+                    metadata={"acceptance_status": "policy_rejected", "detail": last_detail or ""},
+                )
                 if consecutive_failures >= int(self.config.run.max_consecutive_failures):
                     raise
             except (ResearchAgentError, RunnerError, WorktreeError, RuntimeError, ValueError) as exc:
                 consecutive_failures += 1
+                last_acceptance_status = self._classify_failure(exc)
+                last_canonical_stage = None
+                last_canonical_score = None
+                last_detail = self._summarize_exception_detail(exc)
                 self._record_failed_trial(
                     trial_id=trial_id,
                     trial_branch=trial_branch,
@@ -594,8 +911,30 @@ class BoaController:
                     candidate=candidate,
                     descriptor=descriptor,
                     diff_path=diff_path,
-                    acceptance_status=self._classify_failure(exc),
+                    acceptance_status=last_acceptance_status,
                     exc=exc,
+                )
+                self._emit(
+                    kind="trial_failed",
+                    message=f"Trial {trial_id} failed with status {last_acceptance_status}",
+                    trial_id=trial_id,
+                    metadata={"acceptance_status": last_acceptance_status or "unknown", "detail": last_detail or ""},
                 )
                 if consecutive_failures >= int(self.config.run.max_consecutive_failures):
                     raise
+        summary = RunSummary(
+            trials_attempted=trials_attempted,
+            stop_requested=False,
+            last_trial_id=last_trial_id,
+            last_acceptance_status=last_acceptance_status,
+            last_canonical_stage=last_canonical_stage,
+            last_canonical_score=last_canonical_score,
+            last_detail=last_detail,
+        )
+        self._emit(
+            kind="run_completed",
+            message="BOA run completed",
+            trial_id=last_trial_id,
+            metadata={"acceptance_status": last_acceptance_status or "unknown"},
+        )
+        return summary

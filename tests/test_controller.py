@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 
 from boaresearch.runtime import BoaController
+from boaresearch.runtime.controller import ControllerStateError
+from boaresearch.runtime.observer import RunEvent
 from boaresearch.runner import StageExecution
 from boaresearch.schema import (
     BoaConfig,
@@ -148,6 +150,29 @@ class FakeAgent:
         )
 
 
+class NoTraceAgent(FakeAgent):
+    def plan_trial(self, context) -> CandidatePlan:
+        del context
+        return CandidatePlan(
+            hypothesis="h",
+            rationale_summary="plan",
+            selected_parent_branch=self.plan_branch,
+            selected_parent_trial_id=None,
+            patch_category="optimizer",
+            operation_type="replace",
+            estimated_risk=0.2,
+            informed_by_call_ids=["missing-call"],
+        )
+
+
+class RecordingObserver:
+    def __init__(self) -> None:
+        self.events: list[RunEvent] = []
+
+    def emit(self, event: RunEvent) -> None:
+        self.events.append(event)
+
+
 class ControllerTests(unittest.TestCase):
     def _controller(
         self,
@@ -156,12 +181,13 @@ class ControllerTests(unittest.TestCase):
         repo: Path | None = None,
         runner: FakeRunner | None = None,
         worktree: FakeWorktree | None = None,
+        observer: RecordingObserver | None = None,
     ) -> tuple[BoaController, Path]:
         repo = repo or Path(tempfile.mkdtemp())
         subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
         (repo / "boa.md").write_text("# BOA\n", encoding="utf-8")
         (repo / "boa.config").write_text("schema_version = 3\n", encoding="utf-8")
-        controller = BoaController(build_config(repo))
+        controller = BoaController(build_config(repo), observer=observer)
         controller.agent = fake_agent
         controller.runner = runner or FakeRunner()
         controller.worktree = worktree or FakeWorktree(repo / ".boa" / "worktrees" / "demo")
@@ -191,6 +217,44 @@ class ControllerTests(unittest.TestCase):
             canonical_stage="scout",
             canonical_score=0.7,
         )
+
+    def test_tool_context_trace_path_is_inside_worktree_for_agent_sandbox(self) -> None:
+        controller, _repo = self._controller(fake_agent=FakeAgent(plan_branch="boa/demo/accepted"))
+        controller._prepare_planning_workspace()
+
+        context = controller._build_planning_context(trial_id="demo-0001", recent_trials=[])
+        tool_context = read_search_tool_context(context.tool_context_path)
+
+        self.assertIsNotNone(tool_context.trace_path)
+        self.assertTrue(str(tool_context.trace_path).startswith(str(controller.worktree.worktree_path)))
+        self.assertIn("/.boa/agent_traces/demo-0001/search_calls.jsonl", str(tool_context.trace_path))
+        self.assertTrue(str(context.plan_output_path).startswith(str(controller.worktree.worktree_path)))
+        self.assertIn("/.boa/agent_outputs/demo-0001/plan.json", str(context.plan_output_path))
+
+    def test_execution_candidate_output_path_is_inside_worktree_for_agent_sandbox(self) -> None:
+        controller, _repo = self._controller(fake_agent=FakeAgent(plan_branch="boa/demo/accepted"))
+        controller._prepare_planning_workspace()
+
+        candidate_plan = CandidatePlan(
+            hypothesis="h",
+            rationale_summary="plan",
+            selected_parent_branch="boa/demo/accepted",
+            patch_category="optimizer",
+            operation_type="replace",
+            estimated_risk=0.2,
+            informed_by_call_ids=["boa-call-1"],
+        )
+        context = controller._build_execution_context(
+            trial_id="demo-0001",
+            trial_branch="boa/demo/trial/demo-0001",
+            parent_branch="boa/demo/accepted",
+            parent_trial_id=None,
+            recent_trials=[],
+            candidate_plan=candidate_plan,
+        )
+
+        self.assertTrue(str(context.candidate_output_path).startswith(str(controller.worktree.worktree_path)))
+        self.assertIn("/.boa/agent_outputs/demo-0001/candidate.json", str(context.candidate_output_path))
 
     def test_run_uses_prior_trial_parent_and_accepts(self) -> None:
         controller, _repo = self._controller(fake_agent=FakeAgent(plan_branch="boa/demo/trial/prior-0001"))
@@ -223,6 +287,14 @@ class ControllerTests(unittest.TestCase):
         recent = controller.store.recent_trials(limit=5, run_tag="demo")
         trial = next(item for item in recent if item.trial_id.endswith("0001"))
         self.assertEqual(trial.acceptance_status, "policy_rejected")
+
+    def test_missing_trace_gives_clear_policy_rejection_detail(self) -> None:
+        controller, _repo = self._controller(fake_agent=NoTraceAgent(plan_branch="boa/demo/accepted"))
+
+        summary = controller.run()
+
+        self.assertEqual(summary.last_acceptance_status, "policy_rejected")
+        self.assertIn("recorded no tool calls", summary.last_detail or "")
 
     def test_second_controller_run_uses_next_trial_id(self) -> None:
         repo = Path(tempfile.mkdtemp())
@@ -283,6 +355,68 @@ class ControllerTests(unittest.TestCase):
         trial = next(item for item in recent if item.trial_id.endswith("0001"))
         self.assertEqual(trial.acceptance_status, "completed_rejected")
         self.assertEqual(trial.canonical_stage, "scout")
+
+    def test_ensure_ready_rejects_repo_without_initial_commit(self) -> None:
+        repo = Path(tempfile.mkdtemp())
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        (repo / "boa.md").write_text("# BOA\n", encoding="utf-8")
+        (repo / "boa.config").write_text("schema_version = 3\n", encoding="utf-8")
+
+        controller = BoaController(build_config(repo))
+
+        with self.assertRaises(ControllerStateError) as exc:
+            controller._ensure_ready()  # noqa: SLF001
+
+        self.assertIn("requires at least one commit", str(exc.exception))
+        self.assertIn("main", str(exc.exception))
+
+    def test_seed_baseline_metric_missing_raises_clear_error_and_records_status(self) -> None:
+        repo = Path(tempfile.mkdtemp())
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        (repo / "boa.md").write_text("# BOA\n", encoding="utf-8")
+        (repo / "boa.config").write_text("schema_version = 3\n", encoding="utf-8")
+
+        controller = BoaController(build_config(repo))
+        controller.agent = FakeAgent(plan_branch="boa/demo/accepted")
+        controller.runner = FakeRunner(status="metric_missing")
+        controller.worktree = FakeWorktree(repo / ".boa" / "worktrees" / "demo")
+        controller.store.ensure_schema()
+        controller._ensure_ready = lambda: controller.store.ensure_schema()  # type: ignore[method-assign]
+        controller._run_preflight = lambda: None  # type: ignore[method-assign]
+
+        with self.assertRaises(ControllerStateError) as exc:
+            controller._seed_baseline("scout")  # noqa: SLF001
+
+        self.assertIn("Accepted-branch baseline failed", str(exc.exception))
+        recent = controller.store.recent_trials(limit=5, run_tag="demo")
+        baseline = next(item for item in recent if item.trial_id == "demo-baseline-scout")
+        self.assertEqual(baseline.acceptance_status, "metric_missing")
+
+    def test_summarize_exception_detail_prefers_json_message(self) -> None:
+        exc = RuntimeError(
+            'CLI agent failed.\nstderr:\nERROR: {"error":{"message":"Invalid schema: Missing \\"notes\\"."},"status":400}'
+        )
+        self.assertEqual(
+            BoaController._summarize_exception_detail(exc),  # noqa: SLF001
+            'Invalid schema: Missing "notes".',
+        )
+
+    def test_controller_emits_progress_events(self) -> None:
+        observer = RecordingObserver()
+        controller, _repo = self._controller(
+            fake_agent=FakeAgent(plan_branch="boa/demo/accepted"),
+            observer=observer,
+        )
+
+        controller.run()
+
+        kinds = [event.kind for event in observer.events]
+        self.assertIn("run_started", kinds)
+        self.assertIn("trial_started", kinds)
+        self.assertIn("planning_started", kinds)
+        self.assertIn("execution_started", kinds)
+        self.assertIn("stage_started", kinds)
+        self.assertIn("trial_completed", kinds)
 
 
 if __name__ == "__main__":
