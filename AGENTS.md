@@ -17,6 +17,7 @@ This repository packages BOA (Bayesian Optimized Agents) as a reusable Python to
   - diff computation
   - metric extraction
   - stage outcomes
+  - post-stage reflection and lesson memory
   - acceptance / rejection / promotion
   - experiment persistence
 
@@ -40,6 +41,10 @@ This repository packages BOA (Bayesian Optimized Agents) as a reusable Python to
   - `boa tools score-candidate-descriptor`
   - `boa tools rank-patch-families`
   - `boa tools propose-numeric-knob-regions`
+- Planning prompts also include BOA-authored static context:
+  - compact lesson memory derived from prior trial reflections and follow-up outcomes
+  - an advisory BO suggestion report for likely next variations
+  - a trial dataset with prior descriptors and recorded metric outcomes
 - Managed branches are:
   - accepted branch: `boa/<run_tag>/accepted`
   - trial branch: `boa/<run_tag>/trial/<trial_id>`
@@ -99,11 +104,14 @@ If this layout changes materially, update this file in the same change.
 - Endpoints run in two phases:
   - planning on the accepted-branch workspace
   - execution inside the BOA-managed trial worktree
+- After evaluation, BOA may invoke the configured agent in a reflection phase that inspects stage output and emits one compact trial reflection JSON object. Reflection is analysis-only and does not edit files, choose branches, or affect acceptance directly.
 - Endpoints may inspect the workspace and edit only allowed files during execution.
 - Endpoints must not make acceptance, promotion, persistence, or arbitrary branch-policy decisions.
 - Endpoints may choose a parent lineage only from BOA-provided lineage options.
 - Endpoints must emit exactly one candidate plan JSON object and exactly one candidate metadata JSON object at the BOA-designated paths for the current trial.
 - Endpoints may call BOA tools multiple times during planning and execution.
+- During planning, BOA injects compact lesson memory, an advisory static BO suggestion report, and a static trial dataset into the prompt. These are decision-support context only; the endpoint may ignore them.
+- During execution, the endpoint is expected to leave at least one surviving tracked edit under allowed paths before emitting candidate metadata. If BOA validates a clean worktree, it may issue one explicit retry request before marking the trial as `no_patch`.
 - BOA computes the actual diff, touched files, descriptor, validated branch lineage, and evaluation outcomes.
 
 Candidate plan fields are:
@@ -119,6 +127,7 @@ Candidate plan fields are:
 - optional `numeric_knobs`
 - optional `notes`
 - `informed_by_call_ids`
+- `addressed_lesson_ids`
 
 Candidate metadata fields are:
 
@@ -131,8 +140,9 @@ Candidate metadata fields are:
 - optional `numeric_knobs`
 - optional `notes`
 - `informed_by_call_ids`
+- `addressed_lesson_ids`
 
-If the candidate plan or candidate metadata is missing, malformed, cites unknown BO tool call ids, selects an invalid parent branch, or is inconsistent with the produced diff, BOA treats the trial as failed or policy-rejected.
+If the candidate plan or candidate metadata is missing, malformed, cites unknown BO tool call ids, cites unknown lesson ids, selects an invalid parent branch, or is inconsistent with the produced diff, BOA treats the trial as failed or policy-rejected.
 
 ## Trial Semantics
 
@@ -167,6 +177,7 @@ The following trial outcomes should remain distinct in persistence and reporting
 - BOA remains the source of truth for trial state and acceptance.
 - Stages are `scout`, optional `confirm`, and optional `promoted`.
 - Each stage runs configured commands, captures stdout and stderr, enforces timeouts, and records simple resource metadata.
+- After the highest completed stage or first failing stage is known, BOA may run a reflection pass over a capped excerpt of stage output and persist the resulting compact reflection alongside the trial.
 - Metrics can come from:
   - JSON files
   - regexes over logs
@@ -190,6 +201,10 @@ The following trial outcomes should remain distinct in persistence and reporting
   - candidate descriptor scoring
   - patch family ranking
   - numeric knob region proposals
+- BOA also materializes planning-only static search context from experiment memory:
+  - compact lesson memory from prior trial reflections plus later addressed outcomes
+  - an advisory next-variation report
+  - a metric-labelled trial dataset of prior modifications
 - BOA validates any lineage chosen by the agent before the trial branch is created.
 
 ## Config Discipline
@@ -203,7 +218,7 @@ The following trial outcomes should remain distinct in persistence and reporting
 ## Working Rules For Agents
 
 - Preserve the target-repo contract around `boa init`, `boa run`, `boa.md`, `boa.config`, `.boa/`, and managed BOA branches.
-- Keep BOA’s init, acceptance, and search decisions inside BOA, not inside endpoint-specific adapters.
+- Keep BOA's init, acceptance, search, and reflection-memory decisions inside BOA, not inside endpoint-specific adapters.
 - Do not let endpoint adapters silently define runtime paths, acceptance behavior, or branch policy.
 - If a change materially affects architecture, workflow, public contracts, runtime paths, branch policy, config schema, persistence schema, or testing expectations, update this `AGENTS.md` in the same change.
 - Treat `AGENTS.md` as a living contract. When major changes are made, upgrade this file so future agents inherit an accurate description of the repo.

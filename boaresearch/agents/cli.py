@@ -7,11 +7,58 @@ import subprocess
 from pathlib import Path
 
 from ..process import run_process_with_live_output
-from ..prompt_builder import build_cli_execution_bundle, build_cli_planning_bundle
+from ..prompt_builder import build_cli_execution_bundle, build_cli_planning_bundle, build_cli_reflection_bundle
 from ..runtime.observer import RunEvent
-from ..schema import AgentExecutionContext, AgentPlanningContext, CandidateMetadata, CandidatePlan
+from ..schema import AgentExecutionContext, AgentPlanningContext, AgentReflectionContext, CandidateMetadata, CandidatePlan, TrialReflection
 from .base import BaseResearchAgent, ResearchAgentError
 from .interaction import BoaInteractionLayer
+
+
+_PWSH_SHIM_PROJECT = """<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>pwsh</AssemblyName>
+    <RootNamespace>BoaPwshShim</RootNamespace>
+    <UseAppHost>true</UseAppHost>
+  </PropertyGroup>
+</Project>
+"""
+
+_PWSH_SHIM_PROGRAM = """using System.Diagnostics;
+
+static int MainImpl(string[] args)
+{
+    if (args.Length == 1 && args[0] == "--version")
+    {
+        Console.Out.WriteLine("PowerShell 7.0.0");
+        return 0;
+    }
+
+    var startInfo = new ProcessStartInfo("powershell.exe")
+    {
+        UseShellExecute = false,
+    };
+    foreach (var arg in args)
+    {
+        startInfo.ArgumentList.Add(arg);
+    }
+
+    using var process = Process.Start(startInfo);
+    if (process is null)
+    {
+        Console.Error.WriteLine("Failed to start powershell.exe");
+        return 1;
+    }
+
+    process.WaitForExit();
+    return process.ExitCode;
+}
+
+return MainImpl(args);
+"""
 
 
 class CliResearchAgent(BaseResearchAgent):
@@ -52,6 +99,7 @@ class CliResearchAgent(BaseResearchAgent):
         tool_context_path: Path,
         plan_path: Path,
         candidate_path: Path,
+        reflection_path: Path,
     ) -> dict[str, str]:
         return {
             "agent": str(self.agent_config.preset),
@@ -68,6 +116,7 @@ class CliResearchAgent(BaseResearchAgent):
             "plan_path": str(plan_path),
             "candidate_path": str(candidate_path),
             "candidate_metadata_path": str(candidate_path),
+            "reflection_path": str(reflection_path),
         }
 
     def _render_template(self, template: str, values: dict[str, str]) -> str:
@@ -149,6 +198,58 @@ class CliResearchAgent(BaseResearchAgent):
             return cleaned
         return cleaned[-limit:]
 
+    @staticmethod
+    def _missing_pwsh_error(stdout: str, stderr: str) -> bool:
+        combined = "\n".join(part for part in [str(stdout or ""), str(stderr or "")] if part).lower()
+        return "pwsh.exe --version" in combined or "aka.ms/powershell" in combined
+
+    def _ensure_pwsh_shim_dir(self) -> Path:
+        runtime_root = self.repo_root / ".boa" / "protected" / "runtime" / "pwsh_shim"
+        publish_dir = runtime_root / "publish"
+        shim_path = publish_dir / "pwsh.exe"
+        if shim_path.exists():
+            return publish_dir
+        source_dir = runtime_root / "src"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        (source_dir / "pwsh.csproj").write_text(_PWSH_SHIM_PROJECT, encoding="utf-8")
+        (source_dir / "Program.cs").write_text(_PWSH_SHIM_PROGRAM, encoding="utf-8")
+        publish_dir.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(
+            [
+                "dotnet",
+                "publish",
+                str(source_dir / "pwsh.csproj"),
+                "-c",
+                "Release",
+                "-o",
+                str(publish_dir),
+                "--nologo",
+            ],
+            cwd=str(source_dir),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if proc.returncode != 0 or not shim_path.exists():
+            detail = self._tail(proc.stderr or proc.stdout or "<empty>")
+            raise ResearchAgentError(
+                "Codex requested `pwsh.exe`, but it is not available and BOA could not build a local compatibility shim.\n"
+                f"build output:\n{detail}"
+            )
+        return publish_dir
+
+    def _with_pwsh_shim_env(self, env: dict[str, str]) -> dict[str, str]:
+        if os.name != "nt":
+            return env
+        if shutil.which("pwsh.exe"):
+            return env
+        shim_dir = self._ensure_pwsh_shim_dir()
+        updated = dict(env)
+        existing_path = str(updated.get("PATH") or os.environ.get("PATH") or "")
+        updated["PATH"] = str(shim_dir) if not existing_path else f"{shim_dir}{os.pathsep}{existing_path}"
+        return updated
+
     def _write_planning_bundle(self, context: AgentPlanningContext) -> dict[str, Path]:
         bundle_root = context.prompt_bundle_dir
         bundle_root.mkdir(parents=True, exist_ok=True)
@@ -199,6 +300,31 @@ class CliResearchAgent(BaseResearchAgent):
         paths["candidate_example"].write_text(bundle["candidate_example"], encoding="utf-8")
         if context.candidate_output_path.exists():
             context.candidate_output_path.unlink()
+        if paths["last_message"].exists():
+            paths["last_message"].unlink()
+        return paths
+
+    def _write_reflection_bundle(self, context: AgentReflectionContext) -> dict[str, Path]:
+        bundle_root = context.prompt_bundle_dir
+        bundle_root.mkdir(parents=True, exist_ok=True)
+        bundle = build_cli_reflection_bundle(context)
+        paths = {
+            "system_prompt": bundle_root / "system_prompt.txt",
+            "task_prompt": bundle_root / "task_prompt.txt",
+            "prompt": bundle_root / "combined_prompt.txt",
+            "reflection_schema": bundle_root / "reflection_schema.json",
+            "reflection_example": bundle_root / "reflection_example.json",
+            "last_message": bundle_root / "last_message.txt",
+            "stdout": bundle_root / "last_stdout.txt",
+            "stderr": bundle_root / "last_stderr.txt",
+        }
+        paths["system_prompt"].write_text(bundle["system_prompt"], encoding="utf-8")
+        paths["task_prompt"].write_text(bundle["task_prompt"], encoding="utf-8")
+        paths["prompt"].write_text(bundle["combined_prompt"], encoding="utf-8")
+        paths["reflection_schema"].write_text(bundle["reflection_schema"], encoding="utf-8")
+        paths["reflection_example"].write_text(bundle["reflection_example"], encoding="utf-8")
+        if context.reflection_output_path.exists():
+            context.reflection_output_path.unlink()
         if paths["last_message"].exists():
             paths["last_message"].unlink()
         return paths
@@ -261,6 +387,9 @@ class CliResearchAgent(BaseResearchAgent):
         env = os.environ.copy()
         env.update({key: self._render_template(value, template_values) for key, value in dict(self.agent_config.env).items()})
         env.update(extra_env)
+        # Codex probes `pwsh.exe` during startup on Windows. If it is missing,
+        # make the shim visible before the first launch so the probe succeeds.
+        env = self._with_pwsh_shim_env(env)
         prompt_text = prompt_path.read_text(encoding="utf-8")
         self._emit(
             kind="agent_prompt_sent",
@@ -393,6 +522,39 @@ class CliResearchAgent(BaseResearchAgent):
                     stdout_source="agent.stdout",
                     stderr_source="agent.stderr",
                 )
+            if proc.returncode != 0 and self._missing_pwsh_error(proc.stdout or "", proc.stderr or ""):
+                self._emit(
+                    kind="agent_environment_retry",
+                    message="Codex requested `pwsh.exe`; retrying with a BOA-managed compatibility shim.",
+                    trial_id=trial_id,
+                    phase=phase,
+                )
+                shim_env = self._with_pwsh_shim_env(env)
+                if self.observer is None:
+                    proc = subprocess.run(
+                        command,
+                        cwd=str(cwd),
+                        input=prompt_text,
+                        capture_output=True,
+                        text=True,
+                        timeout=int(self.agent_config.prepare_timeout_seconds),
+                        check=False,
+                        env=shim_env,
+                    )
+                else:
+                    proc = run_process_with_live_output(
+                        command,
+                        cwd=cwd,
+                        env=shim_env,
+                        input_text=prompt_text,
+                        timeout_seconds=int(self.agent_config.prepare_timeout_seconds),
+                        observer=self.observer,
+                        trial_id=trial_id,
+                        phase=phase,
+                        stage_name=None,
+                        stdout_source="agent.stdout",
+                        stderr_source="agent.stderr",
+                    )
         except FileNotFoundError as exc:
             raise ResearchAgentError(f"CLI agent command not found: {command[0]}") from exc
         except subprocess.TimeoutExpired as exc:
@@ -430,6 +592,7 @@ class CliResearchAgent(BaseResearchAgent):
             tool_context_path=context.tool_context_path,
             plan_path=context.plan_output_path,
             candidate_path=context.plan_output_path,
+            reflection_path=context.plan_output_path,
         )
         env = {
             "BOA_AGENT": str(self.agent_config.preset),
@@ -517,6 +680,7 @@ class CliResearchAgent(BaseResearchAgent):
             tool_context_path=context.tool_context_path,
             plan_path=context.plan_output_path,
             candidate_path=context.candidate_output_path,
+            reflection_path=context.candidate_output_path,
         )
         env = {
             "BOA_AGENT": str(self.agent_config.preset),
@@ -586,3 +750,78 @@ class CliResearchAgent(BaseResearchAgent):
             },
         )
         return candidate
+
+    def reflect_trial(self, context: AgentReflectionContext) -> TrialReflection:
+        bundle_paths = self._write_reflection_bundle(context)
+        self._emit(
+            kind="reflection_bundle_ready",
+            message="Reflection prompt prepared: inspect stage output and emit one compact trial reflection JSON object.",
+            trial_id=context.trial_id,
+            phase="reflection",
+            metadata={"prompt_dir": str(context.prompt_bundle_dir)},
+        )
+        template_values = self._template_values(
+            phase="reflection",
+            trial_id=context.trial_id,
+            worktree_path=context.worktree_path,
+            prompt_dir=context.prompt_bundle_dir,
+            tool_context_path=context.prompt_bundle_dir / "reflection_tool_context_unused.json",
+            plan_path=context.reflection_output_path,
+            candidate_path=context.reflection_output_path,
+            reflection_path=context.reflection_output_path,
+        )
+        env = {
+            "BOA_AGENT": str(self.agent_config.preset),
+            "BOA_AGENT_PHASE": "reflection",
+            "BOA_RUN_TAG": context.run_tag,
+            "BOA_TRIAL_ID": context.trial_id,
+            "BOA_WORKTREE": str(context.worktree_path),
+            "BOA_PROMPT_PATH": str(bundle_paths["prompt"]),
+            "BOA_SYSTEM_PROMPT_PATH": str(bundle_paths["system_prompt"]),
+            "BOA_TASK_PROMPT_PATH": str(bundle_paths["task_prompt"]),
+            "BOA_REFLECTION_SCHEMA_PATH": str(bundle_paths["reflection_schema"]),
+            "BOA_REFLECTION_EXAMPLE_PATH": str(bundle_paths["reflection_example"]),
+            "BOA_REFLECTION_PATH": str(context.reflection_output_path),
+        }
+        if self._is_codex_exec_adapter(template_values):
+            stdout = self._run_codex_exec(
+                trial_id=context.trial_id,
+                phase="reflection",
+                cwd=context.worktree_path,
+                prompt_path=bundle_paths["prompt"],
+                last_message_path=bundle_paths["last_message"],
+                template_values=template_values,
+                extra_env=env,
+                stdout_path=bundle_paths["stdout"],
+                stderr_path=bundle_paths["stderr"],
+            )
+        else:
+            stdout = self._run_cli(
+                trial_id=context.trial_id,
+                phase="reflection",
+                cwd=context.worktree_path,
+                prompt_path=bundle_paths["prompt"],
+                template_values=template_values,
+                extra_env=env,
+                stdout_path=bundle_paths["stdout"],
+                stderr_path=bundle_paths["stderr"],
+            )
+        try:
+            reflection = self.interaction.parse_reflection_output(
+                reflection_path=context.reflection_output_path,
+                stdout=stdout,
+            )
+        except ResearchAgentError as exc:
+            raise ResearchAgentError(
+                f"CLI agent '{self.agent_config.preset}' did not return a valid trial reflection.\n"
+                f"stdout:\n{self._tail(stdout) or '<empty>'}"
+            ) from exc
+        self.interaction.persist_reflection(reflection_path=context.reflection_output_path, reflection=reflection)
+        self._emit(
+            kind="reflection_result",
+            message=f"Reflection ready: stage={reflection.source_stage} | problem={reflection.primary_problem}",
+            trial_id=context.trial_id,
+            phase="reflection",
+            metadata={"source_stage": reflection.source_stage},
+        )
+        return reflection

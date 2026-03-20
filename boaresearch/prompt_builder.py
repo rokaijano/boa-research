@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .prompt_templates import render_prompt_template
-from .schema import AgentExecutionContext, AgentPlanningContext, OPERATION_TYPES, PATCH_CATEGORIES
+from .schema import AgentExecutionContext, AgentPlanningContext, AgentReflectionContext, OPERATION_TYPES, PATCH_CATEGORIES
 
 
 PLAN_SCHEMA: dict[str, Any] = {
@@ -26,6 +26,7 @@ PLAN_SCHEMA: dict[str, Any] = {
         "numeric_knobs",
         "notes",
         "informed_by_call_ids",
+        "addressed_lesson_ids",
     ],
     "properties": {
         "hypothesis": {"type": "string"},
@@ -39,6 +40,7 @@ PLAN_SCHEMA: dict[str, Any] = {
         "numeric_knobs": {"type": "object", "additionalProperties": {"type": "number"}},
         "notes": {"type": ["string", "null"]},
         "informed_by_call_ids": {"type": "array", "items": {"type": "string"}},
+        "addressed_lesson_ids": {"type": "array", "items": {"type": "string"}},
     },
 }
 
@@ -55,6 +57,7 @@ PLAN_EXAMPLE = {
     "numeric_knobs": {"learning_rate": 0.0002, "weight_decay": 0.02, "warmup_steps": 250},
     "notes": "Keep dataset code unchanged.",
     "informed_by_call_ids": ["boa-call-abc123def456"],
+    "addressed_lesson_ids": ["demo-0003:lesson:1"],
 }
 
 
@@ -71,6 +74,7 @@ CANDIDATE_SCHEMA: dict[str, Any] = {
         "numeric_knobs",
         "notes",
         "informed_by_call_ids",
+        "addressed_lesson_ids",
     ],
     "properties": {
         "hypothesis": {"type": "string"},
@@ -82,6 +86,7 @@ CANDIDATE_SCHEMA: dict[str, Any] = {
         "numeric_knobs": {"type": "object", "additionalProperties": {"type": "number"}},
         "notes": {"type": ["string", "null"]},
         "informed_by_call_ids": {"type": "array", "items": {"type": "string"}},
+        "addressed_lesson_ids": {"type": "array", "items": {"type": "string"}},
     },
 }
 
@@ -96,6 +101,48 @@ CANDIDATE_EXAMPLE = {
     "numeric_knobs": {"learning_rate": 0.0002, "weight_decay": 0.02, "warmup_steps": 250},
     "notes": "Keep dataset code unchanged.",
     "informed_by_call_ids": ["boa-call-abc123def456", "boa-call-fed654cba321"],
+    "addressed_lesson_ids": ["demo-0003:lesson:1"],
+}
+
+
+REFLECTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "source_stage",
+        "source_commands",
+        "behavior_summary",
+        "primary_problem",
+        "under_optimized",
+        "suggested_fixes",
+        "evidence",
+        "outcome",
+    ],
+    "properties": {
+        "source_stage": {"type": "string"},
+        "source_commands": {"type": "array", "items": {"type": "string"}},
+        "behavior_summary": {"type": "string"},
+        "primary_problem": {"type": "string"},
+        "under_optimized": {"type": "array", "items": {"type": "string"}},
+        "suggested_fixes": {"type": "array", "items": {"type": "string"}},
+        "evidence": {"type": "array", "items": {"type": "string"}},
+        "outcome": {"type": "string"},
+    },
+}
+
+
+REFLECTION_EXAMPLE = {
+    "source_stage": "scout",
+    "source_commands": ["python train.py --device cpu"],
+    "behavior_summary": "Training improves early, then validation plateaus while train loss keeps dropping.",
+    "primary_problem": "Generalization is lagging the training fit.",
+    "under_optimized": ["regularization strength", "learning-rate decay timing"],
+    "suggested_fixes": [
+        "Increase weight decay or dropout modestly.",
+        "Trigger LR decay earlier once validation stalls.",
+    ],
+    "evidence": ["train_loss fell while val_accuracy stalled", "no hard runtime failure in logs"],
+    "outcome": "Patch completed but evidence suggests the attempted fix was not enough yet.",
 }
 
 
@@ -241,6 +288,9 @@ def build_planning_task(context: AgentPlanningContext) -> str:
         plan_output_path=str(context.plan_output_path),
         recent_trials="\n".join(recent_lines) if recent_lines else "<no prior trials recorded>",
         bootstrap_tool_calls=_bootstrap_tool_sections(context.bootstrap_tool_calls),
+        lesson_memory=json.dumps(context.lesson_memory, indent=2, sort_keys=True),
+        bo_suggestion_report=json.dumps(context.bo_suggestion_report, indent=2, sort_keys=True),
+        trial_dataset=json.dumps(context.trial_dataset, indent=2, sort_keys=True),
     )
 
 
@@ -272,6 +322,38 @@ def build_execution_task(context: AgentExecutionContext) -> str:
         recent_trials="\n".join(recent_lines) if recent_lines else "<no prior trials recorded>",
         bootstrap_tool_calls=_bootstrap_tool_sections(context.bootstrap_tool_calls),
         preflight_commands="\n".join(context.preflight_commands) if context.preflight_commands else "<none>",
+        attempt_index=str(context.attempt_index),
+        execution_feedback=context.execution_feedback or "<none>",
+    )
+
+
+def build_reflection_system_prompt(*, context: AgentReflectionContext) -> str:
+    return render_prompt_template(
+        "agent",
+        "reflection_system.md",
+        trial_id=context.trial_id,
+    )
+
+
+def build_reflection_task(context: AgentReflectionContext) -> str:
+    payload = {
+        "trial_id": context.trial_id,
+        "objective_summary": context.objective_summary,
+        "acceptance_status": context.acceptance_status,
+        "canonical_stage": context.canonical_stage,
+        "source_stage": context.source_stage,
+        "source_stage_status": context.source_stage_status,
+        "source_stage_reason": context.source_stage_reason,
+        "stage_metrics": dict(context.stage_metrics),
+        "candidate_plan": context.candidate_plan.__dict__,
+        "candidate": context.candidate.__dict__,
+        "command_evidence": [item.__dict__ for item in context.command_evidence],
+    }
+    return render_prompt_template(
+        "agent",
+        "reflection_task.md",
+        reflection_output_path=str(context.reflection_output_path),
+        reflection_payload=json.dumps(payload, indent=2, sort_keys=True),
     )
 
 
@@ -340,4 +422,33 @@ def build_cli_execution_bundle(
         "combined_prompt": combined,
         "candidate_schema": json.dumps(CANDIDATE_SCHEMA, indent=2, sort_keys=True),
         "candidate_example": json.dumps(CANDIDATE_EXAMPLE, indent=2, sort_keys=True),
+    }
+
+
+def build_cli_reflection_bundle(context: AgentReflectionContext) -> dict[str, str]:
+    system_prompt = build_reflection_system_prompt(context=context)
+    task_prompt = build_reflection_task(context)
+    output_instructions = "\n\n".join(
+        [
+            "Trial reflection schema:",
+            f"```json\n{json.dumps(REFLECTION_SCHEMA, indent=2, sort_keys=True)}\n```",
+            "Example trial reflection:",
+            f"```json\n{json.dumps(REFLECTION_EXAMPLE, indent=2, sort_keys=True)}\n```",
+        ]
+    )
+    combined = "\n\n".join(
+        [
+            "SYSTEM PROMPT",
+            system_prompt,
+            "TASK PROMPT",
+            task_prompt,
+            output_instructions,
+        ]
+    )
+    return {
+        "system_prompt": system_prompt,
+        "task_prompt": task_prompt,
+        "combined_prompt": combined,
+        "reflection_schema": json.dumps(REFLECTION_SCHEMA, indent=2, sort_keys=True),
+        "reflection_example": json.dumps(REFLECTION_EXAMPLE, indent=2, sort_keys=True),
     }

@@ -8,7 +8,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..schema import CandidateMetadata, CandidatePlan, IncumbentRecord, PatchDescriptor, SearchToolCall, StageRunResult, TrialSummary
+from ..schema import (
+    CandidateMetadata,
+    CandidatePlan,
+    IncumbentRecord,
+    PatchDescriptor,
+    SearchToolCall,
+    StageRunResult,
+    TrialReflection,
+    TrialSummary,
+)
 
 
 def utc_now() -> str:
@@ -44,6 +53,13 @@ def _load_descriptor(text: str | None) -> PatchDescriptor | None:
     return PatchDescriptor(**data)
 
 
+def _load_reflection(text: str | None) -> TrialReflection | None:
+    if not text:
+        return None
+    data = json.loads(text)
+    return TrialReflection(**data)
+
+
 def _load_search_trace(text: str | None) -> list[SearchToolCall]:
     if not text:
         return []
@@ -66,7 +82,7 @@ class ExperimentStore:
 
     def _ensure_trial_columns(self, conn: sqlite3.Connection) -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(trials)").fetchall()}
-        for name in ("candidate_plan_json", "search_trace_json"):
+        for name in ("candidate_plan_json", "search_trace_json", "reflection_json"):
             if name not in columns:
                 conn.execute(f"ALTER TABLE trials ADD COLUMN {name} TEXT")
 
@@ -86,6 +102,7 @@ class ExperimentStore:
                     candidate_plan_json TEXT,
                     candidate_json TEXT,
                     descriptor_json TEXT,
+                    reflection_json TEXT,
                     search_trace_json TEXT,
                     diff_path TEXT,
                     created_at TEXT NOT NULL,
@@ -196,6 +213,21 @@ class ExperimentStore:
                 ),
             )
 
+    def update_trial_reflection(self, *, trial_id: str, reflection: TrialReflection) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE trials
+                SET reflection_json = ?, updated_at = ?
+                WHERE trial_id = ?
+                """,
+                (
+                    json.dumps(reflection, default=_json_default, sort_keys=True),
+                    utc_now(),
+                    trial_id,
+                ),
+            )
+
     def set_acceptance(
         self,
         *,
@@ -291,7 +323,7 @@ class ExperimentStore:
         query = """
             SELECT trial_id, run_tag, branch_name, parent_branch, parent_trial_id, acceptance_status,
                    canonical_stage, canonical_score, candidate_plan_json, candidate_json,
-                   descriptor_json, search_trace_json, created_at, updated_at
+                   descriptor_json, reflection_json, search_trace_json, created_at, updated_at
             FROM trials
         """
         params: list[Any] = []
@@ -326,6 +358,7 @@ class ExperimentStore:
                     candidate_plan=_load_candidate_plan(row["candidate_plan_json"]),
                     candidate=_load_candidate(row["candidate_json"]),
                     descriptor=_load_descriptor(row["descriptor_json"]),
+                    reflection=_load_reflection(row["reflection_json"]),
                     search_trace=_load_search_trace(row["search_trace_json"]),
                     stage_scores=stage_scores.get(row["trial_id"], {}),
                     created_at=row["created_at"],

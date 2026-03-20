@@ -29,6 +29,7 @@ class CandidatePlanSubmissionRecorder:
         numeric_knobs: Optional[dict[str, float]] = None,
         notes: Optional[str] = None,
         informed_by_call_ids: Optional[list[str]] = None,
+        addressed_lesson_ids: Optional[list[str]] = None,
     ) -> None:
         self.plan = self.interaction.parse_plan_payload(
             {
@@ -43,6 +44,7 @@ class CandidatePlanSubmissionRecorder:
                 "numeric_knobs": numeric_knobs or {},
                 "notes": notes,
                 "informed_by_call_ids": informed_by_call_ids or [],
+                "addressed_lesson_ids": addressed_lesson_ids or [],
             }
         )
 
@@ -64,6 +66,7 @@ class CandidateSubmissionRecorder:
         numeric_knobs: Optional[dict[str, float]] = None,
         notes: Optional[str] = None,
         informed_by_call_ids: Optional[list[str]] = None,
+        addressed_lesson_ids: Optional[list[str]] = None,
     ) -> None:
         self.candidate = self.interaction.parse_candidate_payload(
             {
@@ -76,6 +79,7 @@ class CandidateSubmissionRecorder:
                 "numeric_knobs": numeric_knobs or {},
                 "notes": notes,
                 "informed_by_call_ids": informed_by_call_ids or [],
+                "addressed_lesson_ids": addressed_lesson_ids or [],
             }
         )
 
@@ -254,6 +258,7 @@ class AgentToolHarness:
         target_symbols: Optional[list[str]] = None,
         numeric_knobs: Optional[dict[str, float]] = None,
         notes: Optional[str] = None,
+        addressed_lesson_ids: Optional[list[str]] = None,
     ) -> str:
         if self._plan_submission is None:
             raise ResearchAgentError("submit_candidate_plan is not available in this phase")
@@ -269,6 +274,7 @@ class AgentToolHarness:
             numeric_knobs=numeric_knobs,
             notes=notes,
             informed_by_call_ids=informed_by_call_ids,
+            addressed_lesson_ids=addressed_lesson_ids,
         )
         return "Candidate plan recorded."
 
@@ -283,6 +289,7 @@ class AgentToolHarness:
         target_symbols: Optional[list[str]] = None,
         numeric_knobs: Optional[dict[str, float]] = None,
         notes: Optional[str] = None,
+        addressed_lesson_ids: Optional[list[str]] = None,
     ) -> str:
         if self._candidate_submission is None:
             raise ResearchAgentError("submit_candidate is not available in this phase")
@@ -296,6 +303,7 @@ class AgentToolHarness:
             numeric_knobs=numeric_knobs,
             notes=notes,
             informed_by_call_ids=informed_by_call_ids,
+            addressed_lesson_ids=addressed_lesson_ids,
         )
         return "Candidate metadata recorded."
 

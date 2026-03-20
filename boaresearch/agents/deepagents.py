@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import os
 from pathlib import Path
 from typing import Any, Optional
@@ -11,8 +12,10 @@ from ..prompt_builder import (
     build_execution_task,
     build_planning_system_prompt,
     build_planning_task,
+    build_reflection_system_prompt,
+    build_reflection_task,
 )
-from ..schema import AgentExecutionContext, AgentPlanningContext, CandidateMetadata, CandidatePlan
+from ..schema import AgentExecutionContext, AgentPlanningContext, AgentReflectionContext, CandidateMetadata, CandidatePlan, TrialReflection
 from ..search import SearchOracleService, SearchToolbox, SearchTraceRecorder, read_search_tool_context
 from .base import BaseResearchAgent, ResearchAgentError
 from .interaction import BoaInteractionLayer
@@ -142,7 +145,7 @@ class DeepAgentsResearchAgent(BaseResearchAgent):
     def _memories_path(self, run_tag: str) -> Path:
         return self.repo_root / ".boa" / "runtime" / "deepagents" / run_tag / "memories"
 
-    def _invoke_phase(self, *, worktree_path: Path, run_tag: str, tools: list[object], system_prompt: str, task: str, max_agent_steps: int) -> None:
+    def _invoke_phase(self, *, worktree_path: Path, run_tag: str, tools: list[object], system_prompt: str, task: str, max_agent_steps: int) -> Any:
         memories_path = self._memories_path(run_tag)
         memories_path.mkdir(parents=True, exist_ok=True)
         model = self._build_model()
@@ -154,7 +157,23 @@ class DeepAgentsResearchAgent(BaseResearchAgent):
             system_prompt=system_prompt,
             max_agent_steps=max_agent_steps,
         )
-        self._invoke_agent(agent, task)
+        return self._invoke_agent(agent, task)
+
+    @staticmethod
+    def _stringify_agent_result(result: Any) -> str:
+        if isinstance(result, str):
+            return result
+        if isinstance(result, dict):
+            messages = result.get("messages")
+            if isinstance(messages, list):
+                for message in reversed(messages):
+                    if not isinstance(message, dict):
+                        continue
+                    content = message.get("content")
+                    if isinstance(content, str) and content.strip():
+                        return content
+            return json.dumps(result, indent=2, sort_keys=True)
+        return str(result)
 
     def plan_trial(self, context: AgentPlanningContext) -> CandidatePlan:
         recorder = CandidatePlanSubmissionRecorder()
@@ -205,3 +224,19 @@ class DeepAgentsResearchAgent(BaseResearchAgent):
             raise ResearchAgentError("DeepAgents must call submit_candidate() before returning control")
         self.interaction.persist_candidate(candidate_path=context.candidate_output_path, candidate=recorder.candidate)
         return recorder.candidate
+
+    def reflect_trial(self, context: AgentReflectionContext) -> TrialReflection:
+        result = self._invoke_phase(
+            worktree_path=context.worktree_path,
+            run_tag=context.run_tag,
+            tools=[],
+            system_prompt=build_reflection_system_prompt(context=context),
+            task=build_reflection_task(context),
+            max_agent_steps=context.max_agent_steps,
+        )
+        reflection = self.interaction.parse_reflection_output(
+            reflection_path=context.reflection_output_path,
+            stdout=self._stringify_agent_result(result),
+        )
+        self.interaction.persist_reflection(reflection_path=context.reflection_output_path, reflection=reflection)
+        return reflection

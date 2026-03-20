@@ -11,18 +11,30 @@ from unittest.mock import patch
 
 from boaresearch.agents.cli import CliResearchAgent
 from boaresearch.agents.deepagents import DeepAgentsResearchAgent
-from boaresearch.prompt_builder import CANDIDATE_SCHEMA, PLAN_SCHEMA, build_execution_system_prompt, build_planning_system_prompt
-from boaresearch.prompt_builder import build_execution_task, build_planning_task
+from boaresearch.prompt_builder import (
+    CANDIDATE_SCHEMA,
+    PLAN_SCHEMA,
+    REFLECTION_SCHEMA,
+    build_execution_system_prompt,
+    build_execution_task,
+    build_planning_system_prompt,
+    build_planning_task,
+    build_reflection_system_prompt,
+    build_reflection_task,
+)
 from boaresearch.runtime.observer import RunEvent
 from boaresearch.schema import SearchToolCall
 from boaresearch.schema import (
     AgentConfig,
     AgentExecutionContext,
     AgentPlanningContext,
+    AgentReflectionContext,
     BoaConfig,
+    CandidateMetadata,
     CandidatePlan,
     MetricConfig,
     ObjectiveConfig,
+    ReflectionCommandEvidence,
     RunConfig,
     RunnerConfig,
     RunnerStageConfig,
@@ -87,6 +99,28 @@ def _planning_context(repo: Path) -> AgentPlanningContext:
                 created_at="2026-03-19T10:00:00+00:00",
             )
         ],
+        lesson_memory=[
+            {
+                "lesson_id": "demo-0003:lesson:1",
+                "problem": "Validation stalled after early gains.",
+                "behavior": "Train loss fell while validation plateaued.",
+                "under_optimized": ["regularization"],
+                "suggested_fix": "Increase weight decay slightly.",
+                "evidence": ["train_loss fell while val_accuracy stalled"],
+                "status": "insufficient",
+                "last_trial_id": "demo-0003",
+            }
+        ],
+        bo_suggestion_report={
+            "report_type": "planning_bo_suggestions",
+            "note": "BOA suggestions are advisory only.",
+            "parent_suggestions": [{"branch_name": "boa/demo/accepted"}],
+            "patch_family_ranking": [{"patch_category": "optimizer"}],
+            "numeric_knob_regions": [{"name": "learning_rate", "center": 0.001}],
+            "lineage_options": [{"branch_name": "boa/demo/accepted", "trial_id": None}],
+            "memory_trial_count": 0,
+        },
+        trial_dataset=[],
         objective_summary="Objective",
         max_agent_steps=10,
         prompt_bundle_dir=prompt_dir,
@@ -125,6 +159,8 @@ def _execution_context(repo: Path) -> AgentExecutionContext:
         ],
         objective_summary="Objective",
         preflight_commands=["python check.py"],
+        attempt_index=1,
+        execution_feedback=None,
         max_agent_steps=10,
         prompt_bundle_dir=prompt_dir,
         tool_context_path=tool_context_path,
@@ -138,7 +174,55 @@ def _execution_context(repo: Path) -> AgentExecutionContext:
             operation_type="replace",
             estimated_risk=0.2,
             informed_by_call_ids=["boa-call-1"],
+            addressed_lesson_ids=["demo-0003:lesson:1"],
         ),
+    )
+
+
+def _reflection_context(repo: Path) -> AgentReflectionContext:
+    prompt_dir = repo / "prompts" / "reflection"
+    return AgentReflectionContext(
+        repo_root=repo,
+        worktree_path=repo / "worktree",
+        trial_id="demo-0001",
+        run_tag="demo",
+        objective_summary="Objective",
+        acceptance_status="completed_rejected",
+        canonical_stage="scout",
+        max_agent_steps=10,
+        prompt_bundle_dir=prompt_dir,
+        reflection_output_path=repo / "reflection.json",
+        candidate_plan=CandidatePlan(
+            hypothesis="h",
+            rationale_summary="r",
+            selected_parent_branch="boa/demo/accepted",
+            patch_category="optimizer",
+            operation_type="replace",
+            estimated_risk=0.2,
+            informed_by_call_ids=["boa-call-1"],
+            addressed_lesson_ids=["demo-0003:lesson:1"],
+        ),
+        candidate=CandidateMetadata(
+            hypothesis="h",
+            rationale_summary="r",
+            patch_category="optimizer",
+            operation_type="replace",
+            estimated_risk=0.2,
+            informed_by_call_ids=["boa-call-1"],
+            addressed_lesson_ids=["demo-0003:lesson:1"],
+        ),
+        source_stage="scout",
+        source_stage_status="succeeded",
+        source_stage_reason="threshold_failed,not_improved",
+        stage_metrics={"accuracy": 0.72},
+        command_evidence=[
+            ReflectionCommandEvidence(
+                index=1,
+                command="python train.py --device cpu",
+                stdout_tail="epoch=1 train_loss=0.4 val_accuracy=0.72",
+                stderr_tail="",
+            )
+        ],
     )
 
 
@@ -159,8 +243,10 @@ class CliAgentTests(unittest.TestCase):
     def test_codex_output_schemas_disable_additional_properties(self) -> None:
         self.assertIs(PLAN_SCHEMA["additionalProperties"], False)
         self.assertIs(CANDIDATE_SCHEMA["additionalProperties"], False)
+        self.assertIs(REFLECTION_SCHEMA["additionalProperties"], False)
         self.assertEqual(sorted(PLAN_SCHEMA["required"]), sorted(PLAN_SCHEMA["properties"].keys()))
         self.assertEqual(sorted(CANDIDATE_SCHEMA["required"]), sorted(CANDIDATE_SCHEMA["properties"].keys()))
+        self.assertEqual(sorted(REFLECTION_SCHEMA["required"]), sorted(REFLECTION_SCHEMA["properties"].keys()))
 
     def test_system_prompts_explain_tools_use_json_stdin(self) -> None:
         repo = _make_repo()
@@ -191,10 +277,26 @@ class CliAgentTests(unittest.TestCase):
         execution_task = build_execution_task(_execution_context(repo))
 
         self.assertIn("Bootstrap BOA search context:", planning_task)
+        self.assertIn("BOA lesson memory:", planning_task)
+        self.assertIn("Static BOA suggestion report:", planning_task)
+        self.assertIn("Static BOA trial dataset:", planning_task)
         self.assertIn("boa-call-bootstrap-1", planning_task)
         self.assertIn("list_lineage_options", planning_task)
+        self.assertIn("demo-0003:lesson:1", planning_task)
+        self.assertIn("\"report_type\": \"planning_bo_suggestions\"", planning_task)
         self.assertIn("Bootstrap BOA search context:", execution_task)
         self.assertIn("boa-call-bootstrap-1", execution_task)
+
+    def test_reflection_prompts_stay_compact_and_avoid_bo_tool_contract(self) -> None:
+        repo = _make_repo()
+        system_prompt = build_reflection_system_prompt(context=_reflection_context(repo))
+        task_prompt = build_reflection_task(_reflection_context(repo))
+
+        self.assertNotIn("tools list-lineage-options", system_prompt)
+        self.assertNotIn("tools list-lineage-options", task_prompt)
+        self.assertNotIn("BOA tool call ids", task_prompt)
+        self.assertIn("Reflection input:", task_prompt)
+        self.assertIn("python train.py --device cpu", task_prompt)
 
     def test_plan_trial_writes_boa_tools_launcher_into_prompt_bundle(self) -> None:
         repo = _make_repo()
@@ -207,7 +309,7 @@ class CliAgentTests(unittest.TestCase):
             run_mock.return_value = subprocess.CompletedProcess(
                 args=[],
                 returncode=0,
-                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-1"]}',
+                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-1"],"addressed_lesson_ids":[]}',
                 stderr="",
             )
             agent.plan_trial(context)
@@ -247,6 +349,7 @@ class CliAgentTests(unittest.TestCase):
         self.assertIn("Do not scan `.boa/`", execution_task)
         self.assertIn("Do not try to create, inspect, or validate `.boa/` output directories.", execution_task)
         self.assertIn("Do not attempt to write directly to", execution_task)
+        self.assertIn("must make at least one surviving tracked modification", execution_task)
         self.assertIn("print the single final candidate metadata JSON object to stdout", execution_task)
 
     def test_plan_trial_prefers_fallback_plan_json_over_earlier_shell_json(self) -> None:
@@ -268,7 +371,8 @@ class CliAgentTests(unittest.TestCase):
   "patch_category": "optimizer",
   "operation_type": "replace",
   "estimated_risk": 0.2,
-  "informed_by_call_ids": ["boa-call-bootstrap-1"]
+  "informed_by_call_ids": ["boa-call-bootstrap-1"],
+  "addressed_lesson_ids": []
 }
 ```
 '''
@@ -296,7 +400,7 @@ class CliAgentTests(unittest.TestCase):
             run_mock.return_value = subprocess.CompletedProcess(
                 args=[],
                 returncode=0,
-                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-1"]}',
+                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-1"],"addressed_lesson_ids":[]}',
                 stderr="",
             )
             agent.plan_trial(context)
@@ -322,7 +426,7 @@ class CliAgentTests(unittest.TestCase):
             run_mock.return_value = subprocess.CompletedProcess(
                 args=[],
                 returncode=0,
-                stdout='{"hypothesis":"h","rationale_summary":"r","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-1"]}',
+                stdout='{"hypothesis":"h","rationale_summary":"r","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-1"],"addressed_lesson_ids":[]}',
                 stderr="",
             )
             candidate = agent.prepare_candidate(context)
@@ -330,6 +434,33 @@ class CliAgentTests(unittest.TestCase):
         self.assertEqual(command[1:3], ["exec", "-"])
         self.assertTrue(Path(command[0]).stem.lower().startswith("codex"))
         self.assertEqual(candidate.patch_category, "optimizer")
+
+    def test_codex_reflect_trial_uses_exec_mode(self) -> None:
+        repo = _make_repo()
+        context = _reflection_context(repo)
+        agent = CliResearchAgent(
+            repo_root=repo,
+            agent_config=AgentConfig(preset="codex", runtime="cli", command="codex", model="gpt-5.4"),
+        )
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=(
+                    '{"source_stage":"scout","source_commands":["python train.py --device cpu"],'
+                    '"behavior_summary":"Validation stalled after early gains.",'
+                    '"primary_problem":"Generalization plateaued.","under_optimized":["regularization"],'
+                    '"suggested_fixes":["Increase weight decay slightly."],'
+                    '"evidence":["train loss fell while validation stalled"],'
+                    '"outcome":"Attempted patch was insufficient."}'
+                ),
+                stderr="",
+            )
+            reflection = agent.reflect_trial(context)
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command[1:3], ["exec", "-"])
+        self.assertEqual(reflection.source_stage, "scout")
+        self.assertTrue(context.reflection_output_path.exists())
 
     def test_codex_prepare_candidate_uses_separate_last_message_path(self) -> None:
         repo = _make_repo()
@@ -351,6 +482,7 @@ class CliAgentTests(unittest.TestCase):
                         "operation_type": "replace",
                         "estimated_risk": 0.2,
                         "informed_by_call_ids": ["boa-call-1"],
+                        "addressed_lesson_ids": [],
                     }
                 ),
                 encoding="utf-8",
@@ -387,6 +519,7 @@ class CliAgentTests(unittest.TestCase):
                         "operation_type": "replace",
                         "estimated_risk": 0.2,
                         "informed_by_call_ids": ["boa-call-1"],
+                        "addressed_lesson_ids": [],
                     }
                 ),
                 encoding="utf-8",
@@ -413,7 +546,7 @@ class CliAgentTests(unittest.TestCase):
             run_mock.return_value = subprocess.CompletedProcess(
                 args=[],
                 returncode=0,
-                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-2"]}',
+                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-2"],"addressed_lesson_ids":[]}',
                 stderr="",
             )
             plan = agent.plan_trial(context)
@@ -432,7 +565,7 @@ class CliAgentTests(unittest.TestCase):
             run_mock.return_value = subprocess.CompletedProcess(
                 args=[],
                 returncode=0,
-                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-2"]}',
+                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-2"],"addressed_lesson_ids":[]}',
                 stderr="",
             )
             plan = agent.plan_trial(context)
@@ -458,6 +591,7 @@ class CliAgentTests(unittest.TestCase):
                         "operation_type": "replace",
                         "estimated_risk": 0.2,
                         "informed_by_call_ids": ["boa-call-3"],
+                        "addressed_lesson_ids": [],
                     }
                 ),
                 encoding="utf-8",
@@ -490,6 +624,7 @@ class CliAgentTests(unittest.TestCase):
                         "operation_type": "replace",
                         "estimated_risk": 0.2,
                         "informed_by_call_ids": ["boa-call-3"],
+                        "addressed_lesson_ids": [],
                     }
                 ),
                 encoding="utf-8",
@@ -515,7 +650,7 @@ class CliAgentTests(unittest.TestCase):
             run_mock.return_value = subprocess.CompletedProcess(
                 args=[],
                 returncode=0,
-                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-3"]}',
+                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-3"],"addressed_lesson_ids":[]}',
                 stderr="",
             )
             plan = agent.plan_trial(context)
@@ -542,7 +677,7 @@ class CliAgentTests(unittest.TestCase):
             run_mock.return_value = subprocess.CompletedProcess(
                 args=[],
                 returncode=0,
-                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-3"]}',
+                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-3"],"addressed_lesson_ids":[]}',
                 stderr="",
             )
             agent.plan_trial(context)
@@ -560,7 +695,7 @@ class CliAgentTests(unittest.TestCase):
             run_mock.return_value = subprocess.CompletedProcess(
                 args=[],
                 returncode=0,
-                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-3"]}',
+                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-3"],"addressed_lesson_ids":[]}',
                 stderr="",
             )
             plan = agent.plan_trial(context)
@@ -580,7 +715,7 @@ class CliAgentTests(unittest.TestCase):
             run_mock.return_value = subprocess.CompletedProcess(
                 args=[],
                 returncode=1,
-                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-3"]}',
+                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-3"],"addressed_lesson_ids":[]}',
                 stderr="sandbox denied write",
             )
             plan = agent.plan_trial(context)
@@ -605,6 +740,7 @@ class CliAgentTests(unittest.TestCase):
                         "operation_type": "replace",
                         "estimated_risk": 0.2,
                         "informed_by_call_ids": ["boa-call-3"],
+                        "addressed_lesson_ids": [],
                     }
                 ),
                 encoding="utf-8",
@@ -629,12 +765,43 @@ class CliAgentTests(unittest.TestCase):
             run_mock.return_value = subprocess.CompletedProcess(
                 args=[],
                 returncode=1,
-                stdout='{"hypothesis":"h","rationale_summary":"r","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-1"]}',
+                stdout='{"hypothesis":"h","rationale_summary":"r","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-1"],"addressed_lesson_ids":[]}',
                 stderr="sandbox denied write",
             )
             candidate = agent.prepare_candidate(context)
         self.assertEqual(candidate.patch_category, "optimizer")
         self.assertTrue(context.candidate_output_path.exists())
+
+    def test_codex_plan_trial_retries_with_pwsh_shim_when_codex_reports_missing_pwsh(self) -> None:
+        repo = _make_repo()
+        context = _planning_context(repo)
+        agent = CliResearchAgent(
+            repo_root=repo,
+            agent_config=AgentConfig(preset="codex", runtime="cli", command="codex", model="gpt-5.4"),
+        )
+        shim_dir = repo / ".boa" / "protected" / "runtime" / "pwsh_shim" / "publish"
+        with patch.object(agent, "_ensure_pwsh_shim_dir", return_value=shim_dir):
+            with patch("boaresearch.agents.cli.shutil.which", side_effect=lambda name: None if name == "pwsh.exe" else "codex"):
+                with patch("subprocess.run") as run_mock:
+                    run_mock.side_effect = [
+                        subprocess.CompletedProcess(
+                            args=[],
+                            returncode=1,
+                            stdout="",
+                            stderr="https://aka.ms/powershell. Error: Error: Command failed: pwsh.exe --version",
+                        ),
+                        subprocess.CompletedProcess(
+                            args=[],
+                            returncode=0,
+                            stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-1"],"addressed_lesson_ids":[]}',
+                            stderr="",
+                        ),
+                    ]
+                    plan = agent.plan_trial(context)
+        self.assertEqual(plan.patch_category, "optimizer")
+        self.assertEqual(run_mock.call_count, 2)
+        second_env = run_mock.call_args_list[1].kwargs["env"]
+        self.assertTrue(str(second_env["PATH"]).startswith(str(shim_dir)))
 
     def test_custom_cli_templates_command_args_and_env(self) -> None:
         repo = _make_repo()
@@ -653,7 +820,7 @@ class CliAgentTests(unittest.TestCase):
             run_mock.return_value = subprocess.CompletedProcess(
                 args=[],
                 returncode=0,
-                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-4"]}',
+                stdout='{"hypothesis":"h","rationale_summary":"r","selected_parent_branch":"boa/demo/accepted","patch_category":"optimizer","operation_type":"replace","estimated_risk":0.2,"informed_by_call_ids":["boa-call-4"],"addressed_lesson_ids":[]}',
                 stderr="",
             )
             agent.plan_trial(context)
@@ -679,7 +846,7 @@ class CliAgentTests(unittest.TestCase):
                         "print('agent-live'); "
                         "print('{{\"hypothesis\":\"h\",\"rationale_summary\":\"r\",\"selected_parent_branch\":\"boa/demo/accepted\","
                         "\"patch_category\":\"optimizer\",\"operation_type\":\"replace\",\"estimated_risk\":0.2,"
-                        "\"informed_by_call_ids\":[\"boa-call-5\"]}}')"
+                        "\"informed_by_call_ids\":[\"boa-call-5\"],\"addressed_lesson_ids\":[]}}')"
                     ),
                 ],
             ),
@@ -726,6 +893,7 @@ class DeepAgentsTests(unittest.TestCase):
                     operation_type="replace",
                     estimated_risk=0.2,
                     informed_by_call_ids=[call_id],
+                    addressed_lesson_ids=[],
                 )
                 return {"ok": True}
 
@@ -774,6 +942,7 @@ class DeepAgentsTests(unittest.TestCase):
                     operation_type="replace",
                     estimated_risk=0.2,
                     informed_by_call_ids=[call_id],
+                    addressed_lesson_ids=[],
                 )
                 return {"ok": True}
 
@@ -787,6 +956,39 @@ class DeepAgentsTests(unittest.TestCase):
         self.assertTrue(context.candidate_output_path.exists())
         persisted_payload = json.loads(context.candidate_output_path.read_text(encoding="utf-8"))
         self.assertEqual(persisted_payload["patch_category"], "optimizer")
+
+    def test_deepagents_reflect_trial_parses_json_output(self) -> None:
+        repo = _make_repo()
+        context = _reflection_context(repo)
+        agent = DeepAgentsResearchAgent(
+            repo_root=repo,
+            agent_config=AgentConfig(preset="deepagents", runtime="deepagents", backend="ollama", model="qwen2.5-coder:14b"),
+            config=_minimal_config(repo),
+            run_preflight=lambda: None,
+        )
+
+        class FakeDeepAgent:
+            def invoke(self, payload):
+                del payload
+                return json.dumps(
+                    {
+                        "source_stage": "scout",
+                        "source_commands": ["python train.py --device cpu"],
+                        "behavior_summary": "Validation stalled after early gains.",
+                        "primary_problem": "Generalization plateaued.",
+                        "under_optimized": ["regularization"],
+                        "suggested_fixes": ["Increase weight decay slightly."],
+                        "evidence": ["train loss fell while validation stalled"],
+                        "outcome": "Attempted patch was insufficient.",
+                    }
+                )
+
+        with patch.object(DeepAgentsResearchAgent, "_build_model", return_value=object()):
+            with patch.object(DeepAgentsResearchAgent, "_build_backend", return_value=object()):
+                with patch.object(DeepAgentsResearchAgent, "_create_agent", return_value=FakeDeepAgent()):
+                    reflection = agent.reflect_trial(context)
+        self.assertEqual(reflection.source_stage, "scout")
+        self.assertTrue(context.reflection_output_path.exists())
 
 
 if __name__ == "__main__":

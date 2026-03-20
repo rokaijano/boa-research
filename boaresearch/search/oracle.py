@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from ..schema import BoaConfig, DescriptorDraft, PATCH_CATEGORIES, PatchDescriptor, TrialSummary
+from ..schema import BoaConfig, DescriptorDraft, LessonRecord, PATCH_CATEGORIES, PatchDescriptor, TrialSummary
 from .scoring import descriptor_trials, gaussian_similarity, gp_posterior
 
 
@@ -21,6 +21,63 @@ def summary(trial: TrialSummary) -> dict[str, Any]:
     }
 
 
+def build_lesson_id(trial_id: str, fix_index: int) -> str:
+    return f"{trial_id}:lesson:{fix_index + 1}"
+
+
+def _trim_text(text: Any, limit: int) -> str:
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _trim_string_list(values: list[str], *, limit: int, max_items: int) -> list[str]:
+    trimmed: list[str] = []
+    for raw in list(values or []):
+        value = _trim_text(raw, limit)
+        if value:
+            trimmed.append(value)
+        if len(trimmed) >= max_items:
+            break
+    return trimmed
+
+
+def _trial_addressed_lesson_ids(trial: TrialSummary) -> list[str]:
+    if trial.candidate and trial.candidate.addressed_lesson_ids:
+        return list(trial.candidate.addressed_lesson_ids)
+    if trial.candidate_plan and trial.candidate_plan.addressed_lesson_ids:
+        return list(trial.candidate_plan.addressed_lesson_ids)
+    return []
+
+
+def trial_dataset_row(trial: TrialSummary) -> dict[str, Any]:
+    descriptor = trial.descriptor
+    candidate = trial.candidate
+    candidate_plan = trial.candidate_plan
+    return {
+        "trial_id": trial.trial_id,
+        "branch_name": trial.branch_name,
+        "parent_branch": trial.parent_branch,
+        "parent_trial_id": trial.parent_trial_id,
+        "acceptance_status": trial.acceptance_status,
+        "canonical_stage": trial.canonical_stage,
+        "canonical_score": trial.canonical_score,
+        "stage_scores": dict(trial.stage_scores),
+        "patch_category": descriptor.patch_category if descriptor else None,
+        "operation_type": descriptor.operation_type if descriptor else None,
+        "estimated_risk": descriptor.estimated_risk if descriptor else None,
+        "numeric_knobs": dict(descriptor.numeric_knobs) if descriptor else {},
+        "touched_files": list(descriptor.touched_files) if descriptor else [],
+        "target_symbols": list(descriptor.touched_symbols) if descriptor else [],
+        "rationale_summary": candidate.rationale_summary if candidate else None,
+        "hypothesis": candidate.hypothesis if candidate else None,
+        "addressed_lesson_ids": _trial_addressed_lesson_ids(trial),
+        "planned_parent_branch": candidate_plan.selected_parent_branch if candidate_plan else None,
+        "planned_parent_trial_id": candidate_plan.selected_parent_trial_id if candidate_plan else None,
+    }
+
+
 class SearchOracleService:
     def __init__(self, *, config: BoaConfig, memory: list[TrialSummary], accepted_branch: str) -> None:
         self.config = config
@@ -30,6 +87,74 @@ class SearchOracleService:
     def recent_trials(self, *, limit: Optional[int] = None) -> list[dict[str, Any]]:
         rows = self.memory[: max(1, int(limit or self.config.search.max_history))]
         return [summary(trial) for trial in rows]
+
+    def planning_trial_dataset(self, *, limit: Optional[int] = None) -> list[dict[str, Any]]:
+        rows = self.memory[: max(1, int(limit or self.config.search.max_history))]
+        return [trial_dataset_row(trial) for trial in rows]
+
+    def planning_lesson_memory(self, *, limit: int = 8) -> list[dict[str, Any]]:
+        ordered = sorted(self.memory, key=lambda trial: ((trial.created_at or ""), trial.trial_id))
+        lessons: list[tuple[str, LessonRecord]] = []
+        for index, trial in enumerate(ordered):
+            reflection = trial.reflection
+            if reflection is None:
+                continue
+            suggested_fixes = _trim_string_list(reflection.suggested_fixes, limit=160, max_items=4)
+            if not suggested_fixes:
+                continue
+            under_optimized = _trim_string_list(reflection.under_optimized, limit=80, max_items=4)
+            evidence = _trim_string_list(reflection.evidence, limit=120, max_items=4)
+            problem = _trim_text(reflection.primary_problem, 160)
+            behavior = _trim_text(reflection.behavior_summary, 160)
+            for fix_offset, suggested_fix in enumerate(suggested_fixes):
+                lesson_id = build_lesson_id(trial.trial_id, fix_offset)
+                later_trials = [
+                    item
+                    for item in ordered[index + 1 :]
+                    if lesson_id in _trial_addressed_lesson_ids(item)
+                ]
+                has_success = any(item.acceptance_status == "completed_accepted" for item in later_trials)
+                has_non_success = any(item.acceptance_status != "completed_accepted" for item in later_trials)
+                if not later_trials:
+                    status = "untested"
+                elif has_success and has_non_success:
+                    status = "mixed"
+                elif has_success:
+                    status = "succeeded"
+                else:
+                    status = "insufficient"
+                latest_trial = later_trials[-1] if later_trials else trial
+                lessons.append(
+                    (
+                        latest_trial.created_at or trial.created_at or "",
+                        LessonRecord(
+                            lesson_id=lesson_id,
+                            source_trial_id=trial.trial_id,
+                            source_stage=reflection.source_stage,
+                            problem=problem,
+                            behavior=behavior,
+                            under_optimized=under_optimized,
+                            suggested_fix=suggested_fix,
+                            evidence=evidence,
+                            status=status,
+                            last_trial_id=latest_trial.trial_id,
+                        ),
+                    )
+                )
+        lessons.sort(key=lambda item: (item[0], item[1].lesson_id), reverse=True)
+        return [
+            {
+                "lesson_id": record.lesson_id,
+                "problem": record.problem,
+                "behavior": record.behavior,
+                "under_optimized": list(record.under_optimized),
+                "suggested_fix": record.suggested_fix,
+                "evidence": list(record.evidence),
+                "status": record.status,
+                "last_trial_id": record.last_trial_id,
+            }
+            for _sort_key, record in lessons[: max(1, int(limit))]
+        ]
 
     def list_lineage_options(self, *, limit: Optional[int] = None) -> list[dict[str, Any]]:
         count = max(1, int(limit or self.config.search.max_history))
@@ -337,3 +462,41 @@ class SearchOracleService:
             )
         regions.sort(key=lambda item: (-int(item["count"]), str(item["name"])))
         return regions[:count]
+
+    def planning_suggestion_report(self, *, limit: Optional[int] = None) -> dict[str, Any]:
+        descriptor_trials_memory = descriptor_trials(self.memory)
+        default_family = "misc"
+        if descriptor_trials_memory:
+            family_scores: dict[str, list[float]] = {}
+            for trial in descriptor_trials_memory:
+                assert trial.descriptor is not None
+                family_scores.setdefault(trial.descriptor.patch_category, []).append(float(trial.canonical_score or 0.0))
+            default_family = max(
+                family_scores.items(),
+                key=lambda item: ((sum(item[1]) / len(item[1])) if item[1] else float("-inf"), len(item[1])),
+            )[0]
+        baseline_request = {
+            "patch_category": default_family,
+            "operation_type": "replace",
+            "estimated_risk": 0.25,
+            "limit": max(1, int(limit or self.config.search.parent_suggestion_count)),
+        }
+        return {
+            "report_type": "planning_bo_suggestions",
+            "note": (
+                "BOA suggestions are advisory only. The planning agent may use them, refine them, or ignore them "
+                "when the repository evidence suggests a better move."
+            ),
+            "memory_trial_count": len(self.memory),
+            "lineage_options": self.list_lineage_options(limit=limit),
+            "parent_suggestions": self.suggest_parents(baseline_request),
+            "patch_family_ranking": self.rank_patch_families(baseline_request),
+            "numeric_knob_regions": self.propose_numeric_knob_regions(
+                {
+                    "patch_category": default_family,
+                    "operation_type": "replace",
+                    "estimated_risk": 0.25,
+                    "limit": max(1, int(limit or self.config.search.knob_region_count)),
+                }
+            ),
+        }

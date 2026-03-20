@@ -11,6 +11,7 @@ MetricSource = Literal["json_file", "regex", "metric_file"]
 ObjectiveDirection = Literal["maximize", "minimize"]
 AgentRuntime = Literal["cli", "deepagents"]
 RunnerMode = Literal["local", "ssh"]
+LessonStatus = Literal["untested", "insufficient", "succeeded", "mixed"]
 
 PATCH_CATEGORIES = {
     "optimizer",
@@ -192,6 +193,7 @@ class CandidatePlan:
     numeric_knobs: dict[str, float] = field(default_factory=dict)
     notes: Optional[str] = None
     informed_by_call_ids: list[str] = field(default_factory=list)
+    addressed_lesson_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -205,6 +207,7 @@ class CandidateMetadata:
     numeric_knobs: dict[str, float] = field(default_factory=dict)
     notes: Optional[str] = None
     informed_by_call_ids: list[str] = field(default_factory=list)
+    addressed_lesson_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -220,6 +223,32 @@ class PatchDescriptor:
     parent_trial_id: Optional[str]
     budget_used: str
     diff_path: str
+
+
+@dataclass
+class TrialReflection:
+    source_stage: str
+    source_commands: list[str] = field(default_factory=list)
+    behavior_summary: str = ""
+    primary_problem: str = ""
+    under_optimized: list[str] = field(default_factory=list)
+    suggested_fixes: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)
+    outcome: str = ""
+
+
+@dataclass
+class LessonRecord:
+    lesson_id: str
+    source_trial_id: str
+    source_stage: str
+    problem: str
+    behavior: str
+    under_optimized: list[str] = field(default_factory=list)
+    suggested_fix: str = ""
+    evidence: list[str] = field(default_factory=list)
+    status: LessonStatus = "untested"
+    last_trial_id: Optional[str] = None
 
 
 @dataclass
@@ -245,6 +274,7 @@ class TrialSummary:
     candidate_plan: Optional[CandidatePlan]
     candidate: Optional[CandidateMetadata]
     descriptor: Optional[PatchDescriptor]
+    reflection: Optional[TrialReflection] = None
     search_trace: list[SearchToolCall] = field(default_factory=list)
     stage_scores: dict[str, float] = field(default_factory=dict)
     created_at: str = ""
@@ -320,6 +350,9 @@ class AgentPlanningContext:
     protected_paths: list[str]
     recent_trials: list[TrialSummary]
     bootstrap_tool_calls: list[SearchToolCall]
+    lesson_memory: list[dict[str, Any]]
+    bo_suggestion_report: dict[str, Any]
+    trial_dataset: list[dict[str, Any]]
     objective_summary: str
     max_agent_steps: int
     prompt_bundle_dir: Path
@@ -345,9 +378,40 @@ class AgentExecutionContext:
     bootstrap_tool_calls: list[SearchToolCall]
     objective_summary: str
     preflight_commands: list[str]
+    attempt_index: int
+    execution_feedback: Optional[str]
     max_agent_steps: int
     prompt_bundle_dir: Path
     tool_context_path: Path
     plan_output_path: Path
     candidate_output_path: Path
     candidate_plan: CandidatePlan
+
+
+@dataclass
+class ReflectionCommandEvidence:
+    index: int
+    command: str
+    stdout_tail: str
+    stderr_tail: str
+
+
+@dataclass
+class AgentReflectionContext:
+    repo_root: Path
+    worktree_path: Path
+    trial_id: str
+    run_tag: str
+    objective_summary: str
+    acceptance_status: str
+    canonical_stage: Optional[str]
+    max_agent_steps: int
+    prompt_bundle_dir: Path
+    reflection_output_path: Path
+    candidate_plan: CandidatePlan
+    candidate: CandidateMetadata
+    source_stage: str
+    source_stage_status: str
+    source_stage_reason: str
+    stage_metrics: dict[str, float]
+    command_evidence: list[ReflectionCommandEvidence]

@@ -23,6 +23,7 @@ class BoaInteractionLayerTests(unittest.TestCase):
                     "operation_type": "replace",
                     "estimated_risk": 0.2,
                     "informed_by_call_ids": ["boa-call-1"],
+                    "addressed_lesson_ids": [],
                 }
             ),
             encoding="utf-8",
@@ -38,6 +39,7 @@ class BoaInteractionLayerTests(unittest.TestCase):
                     "operation_type": "replace",
                     "estimated_risk": 0.2,
                     "informed_by_call_ids": ["boa-call-2"],
+                    "addressed_lesson_ids": [],
                 }
             ),
         )
@@ -56,6 +58,7 @@ class BoaInteractionLayerTests(unittest.TestCase):
                     "operation_type": "replace",
                     "estimated_risk": 0.2,
                     "informed_by_call_ids": ["boa-call-2"],
+                    "addressed_lesson_ids": [],
                 }
             ),
         )
@@ -73,6 +76,7 @@ class BoaInteractionLayerTests(unittest.TestCase):
                 "operation_type": "replace",
                 "estimated_risk": 0.2,
                 "informed_by_call_ids": ["boa-call-1"],
+                "addressed_lesson_ids": [],
             }
         )
         candidate = layer.parse_candidate_payload(
@@ -83,6 +87,7 @@ class BoaInteractionLayerTests(unittest.TestCase):
                 "operation_type": "replace",
                 "estimated_risk": 0.2,
                 "informed_by_call_ids": ["boa-call-2"],
+                "addressed_lesson_ids": [],
             }
         )
 
@@ -95,6 +100,46 @@ class BoaInteractionLayerTests(unittest.TestCase):
         candidate_payload = json.loads(candidate_path.read_text(encoding="utf-8"))
         self.assertEqual(plan_payload["selected_parent_branch"], "boa/demo/accepted")
         self.assertEqual(candidate_payload["patch_category"], "optimizer")
+
+    def test_parse_reflection_output_uses_stdout_fallback(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        layer = BoaInteractionLayer()
+        reflection = layer.parse_reflection_output(
+            reflection_path=root / "missing.json",
+            stdout=json.dumps(
+                {
+                    "source_stage": "scout",
+                    "source_commands": ["python train.py"],
+                    "behavior_summary": "Validation stalled after early gains.",
+                    "primary_problem": "Generalization plateaued.",
+                    "under_optimized": ["regularization"],
+                    "suggested_fixes": ["Increase weight decay slightly."],
+                    "evidence": ["train loss fell while val accuracy stalled"],
+                    "outcome": "Attempted patch was insufficient.",
+                }
+            ),
+        )
+        self.assertEqual(reflection.source_stage, "scout")
+
+    def test_persist_reflection_writes_valid_json(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        layer = BoaInteractionLayer()
+        reflection = layer.parse_reflection_payload(
+            {
+                "source_stage": "scout",
+                "source_commands": ["python train.py"],
+                "behavior_summary": "Validation stalled after early gains.",
+                "primary_problem": "Generalization plateaued.",
+                "under_optimized": ["regularization"],
+                "suggested_fixes": ["Increase weight decay slightly."],
+                "evidence": ["train loss fell while val accuracy stalled"],
+                "outcome": "Attempted patch was insufficient.",
+            }
+        )
+        reflection_path = root / "out" / "reflection.json"
+        layer.persist_reflection(reflection_path=reflection_path, reflection=reflection)
+        payload = json.loads(reflection_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["source_stage"], "scout")
 
 
 if __name__ == "__main__":

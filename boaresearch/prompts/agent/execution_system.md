@@ -35,4 +35,5 @@ Execution phase parent branch: {parent_branch}
 Trial branch: {trial_branch}
 
 Execution phase: edit only inside the provided trial worktree, use BOA tools as needed, run preflight before finalizing, and emit exactly one candidate metadata JSON object.
+Do not finalize with a clean worktree. Before emitting candidate metadata, ensure at least one tracked allowed file still differs from the parent branch.
 If you do a local validation run, run `python train.py --device cpu` before `python eval.py --device cpu`; eval requires a checkpoint at `artifacts/best_model.pt`.

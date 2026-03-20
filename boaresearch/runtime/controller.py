@@ -19,11 +19,14 @@ from ..runner import RunnerError, build_trial_runner
 from ..schema import (
     AgentExecutionContext,
     AgentPlanningContext,
+    AgentReflectionContext,
     BoaConfig,
     CandidateMetadata,
     CandidatePlan,
+    ReflectionCommandEvidence,
     SearchToolCall,
     StageRunResult,
+    TrialReflection,
     TrialSummary,
 )
 from ..search import SearchOracleService, SearchToolContext, SearchToolbox, SearchTraceRecorder, load_search_trace, write_search_tool_context
@@ -48,6 +51,15 @@ class RunSummary:
     last_canonical_stage: str | None
     last_canonical_score: float | None
     last_detail: str | None
+
+
+@dataclass
+class EvaluationSummary:
+    acceptance_status: str
+    canonical_stage: str | None
+    canonical_score: float | None
+    canonical_primary_metric: float | None
+    stage_results: list[StageRunResult]
 
 
 class BoaController:
@@ -174,11 +186,17 @@ class BoaController:
     def _candidate_output_path(self, trial_id: str) -> Path:
         return self._agent_output_dir(trial_id) / "candidate.json"
 
+    def _reflection_output_path(self, trial_id: str) -> Path:
+        return self._agent_output_dir(trial_id) / "reflection.json"
+
     def _artifact_plan_path(self, trial_id: str) -> Path:
         return self._trial_artifact_dir(trial_id) / "plan.json"
 
     def _artifact_candidate_path(self, trial_id: str) -> Path:
         return self._trial_artifact_dir(trial_id) / "candidate.json"
+
+    def _artifact_reflection_path(self, trial_id: str) -> Path:
+        return self._trial_artifact_dir(trial_id) / "reflection.json"
 
     def _prompt_bundle_dir(self, trial_id: str, *, phase: str) -> Path:
         path = self.paths.prompt_bundle_dir(trial_id) / phase
@@ -222,6 +240,7 @@ class BoaController:
         self.worktree.prepare_trial(trial_branch=accepted_branch, parent_branch=accepted_branch)
 
     def _build_planning_context(self, *, trial_id: str, recent_trials: list[TrialSummary]) -> AgentPlanningContext:
+        oracle = self._search_oracle(recent_trials)
         bootstrap_tool_calls = self._record_planning_bootstrap_calls(trial_id=trial_id, recent_trials=recent_trials)
         return AgentPlanningContext(
             repo_root=self.config.repo_root,
@@ -235,6 +254,9 @@ class BoaController:
             protected_paths=list(self.config.guardrails.protected_paths),
             recent_trials=recent_trials,
             bootstrap_tool_calls=bootstrap_tool_calls,
+            lesson_memory=oracle.planning_lesson_memory(limit=8),
+            bo_suggestion_report=oracle.planning_suggestion_report(limit=self.config.search.max_history),
+            trial_dataset=oracle.planning_trial_dataset(limit=self.config.search.max_history),
             objective_summary=self._objective_summary(),
             max_agent_steps=int(self.config.agent.max_agent_steps),
             prompt_bundle_dir=self._prompt_bundle_dir(trial_id, phase="planning"),
@@ -251,6 +273,8 @@ class BoaController:
         parent_trial_id: str | None,
         recent_trials: list[TrialSummary],
         candidate_plan: CandidatePlan,
+        attempt_index: int = 1,
+        execution_feedback: str | None = None,
     ) -> AgentExecutionContext:
         return AgentExecutionContext(
             repo_root=self.config.repo_root,
@@ -269,12 +293,83 @@ class BoaController:
             bootstrap_tool_calls=load_search_trace(self._search_trace_path(trial_id)),
             objective_summary=self._objective_summary(),
             preflight_commands=list(self.config.guardrails.preflight_commands),
+            attempt_index=attempt_index,
+            execution_feedback=execution_feedback,
             max_agent_steps=int(self.config.agent.max_agent_steps),
             prompt_bundle_dir=self._prompt_bundle_dir(trial_id, phase="execution"),
             tool_context_path=self._write_tool_context(trial_id=trial_id, phase="execution"),
             plan_output_path=self._plan_output_path(trial_id),
             candidate_output_path=self._candidate_output_path(trial_id),
             candidate_plan=candidate_plan,
+        )
+
+    @staticmethod
+    def _tail_file(path: Path, *, limit: int) -> str:
+        if not path.exists():
+            return ""
+        text = path.read_text(encoding="utf-8", errors="replace")
+        return text[-limit:] if len(text) > limit else text
+
+    @staticmethod
+    def _select_reflection_stage(stage_results: list[StageRunResult]) -> StageRunResult | None:
+        for stage_result in stage_results:
+            if stage_result.status != "succeeded":
+                return stage_result
+        return stage_results[-1] if stage_results else None
+
+    def _select_reflection_commands(self, stage_result: StageRunResult) -> list[ReflectionCommandEvidence]:
+        pattern = re.compile(r"\b(train|training|fit)\b", flags=re.IGNORECASE)
+        selected = sorted(
+            stage_result.command_results,
+            key=lambda item: (0 if pattern.search(item.command) else 1, item.index),
+        )[:2]
+        return [
+            ReflectionCommandEvidence(
+                index=item.index,
+                command=item.command,
+                stdout_tail=self._tail_file(item.stdout_path, limit=2000),
+                stderr_tail=self._tail_file(item.stderr_path, limit=1000),
+            )
+            for item in selected
+        ]
+
+    def _build_reflection_context(
+        self,
+        *,
+        trial_id: str,
+        candidate_plan: CandidatePlan,
+        candidate: CandidateMetadata,
+        evaluation: EvaluationSummary,
+    ) -> AgentReflectionContext | None:
+        source_stage = self._select_reflection_stage(evaluation.stage_results)
+        if source_stage is None:
+            return None
+        return AgentReflectionContext(
+            repo_root=self.config.repo_root,
+            worktree_path=self.worktree.worktree_path,
+            trial_id=trial_id,
+            run_tag=self.config.run.tag,
+            objective_summary=self._objective_summary(),
+            acceptance_status=evaluation.acceptance_status,
+            canonical_stage=evaluation.canonical_stage,
+            max_agent_steps=int(self.config.agent.max_agent_steps),
+            prompt_bundle_dir=self._prompt_bundle_dir(trial_id, phase="reflection"),
+            reflection_output_path=self._reflection_output_path(trial_id),
+            candidate_plan=candidate_plan,
+            candidate=candidate,
+            source_stage=source_stage.stage_name,
+            source_stage_status=source_stage.status,
+            source_stage_reason=source_stage.reason,
+            stage_metrics=dict(source_stage.metrics),
+            command_evidence=self._select_reflection_commands(source_stage),
+        )
+
+    def _no_patch_feedback(self) -> str:
+        allowed = ", ".join(self.config.guardrails.allowed_paths) if self.config.guardrails.allowed_paths else "<all tracked paths>"
+        return (
+            "BOA validated zero surviving tracked file changes after your previous execution attempt. "
+            f"Make a concrete edit in at least one allowed path ({allowed}), verify there is a real tracked diff "
+            "with `git status --short` or equivalent, and only then emit candidate metadata."
         )
 
     def _record_planning_bootstrap_calls(self, *, trial_id: str, recent_trials: list[TrialSummary]) -> list[SearchToolCall]:
@@ -287,6 +382,23 @@ class BoaController:
         toolbox.recent_trials({"limit": self.config.search.max_history})
         toolbox.list_lineage_options({"limit": self.config.search.max_history})
         return load_search_trace(trace_path)
+
+    @staticmethod
+    def _validate_addressed_lesson_ids(lesson_ids: list[str], lesson_memory: list[dict[str, object]]) -> None:
+        known = {str(item.get("lesson_id")) for item in lesson_memory if str(item.get("lesson_id", "")).strip()}
+        unknown = [lesson_id for lesson_id in lesson_ids if lesson_id not in known]
+        if unknown:
+            raise PolicyRejectedError(f"Unknown BOA lesson ids referenced: {', '.join(unknown)}")
+
+    @staticmethod
+    def _validate_candidate_lesson_subset(candidate_ids: list[str], planned_ids: list[str]) -> None:
+        allowed = set(planned_ids)
+        extra = [lesson_id for lesson_id in candidate_ids if lesson_id not in allowed]
+        if extra:
+            raise PolicyRejectedError(
+                "Candidate metadata referenced lesson ids that were not approved in the candidate plan: "
+                + ", ".join(extra)
+            )
 
     def _stage_config(self, stage_name: str):
         return getattr(self.config.runner, stage_name)
@@ -473,6 +585,23 @@ class BoaController:
             encoding="utf-8",
         )
 
+    def _write_reflection_artifact(self, *, trial_id: str, reflection: TrialReflection) -> None:
+        payload = json.dumps(asdict(reflection), indent=2, sort_keys=True) + "\n"
+        self._artifact_reflection_path(trial_id).write_text(payload, encoding="utf-8")
+        self._reflection_output_path(trial_id).write_text(payload, encoding="utf-8")
+
+    @staticmethod
+    def _format_numeric_knob_summary(
+        *,
+        candidate: CandidateMetadata,
+        descriptor: PatchDescriptor,
+    ) -> str:
+        knob_source = candidate.numeric_knobs or descriptor.numeric_knobs
+        if not knob_source:
+            return ""
+        first_knob = next(iter(knob_source.items()))
+        return f" | knob={first_knob[0]}={first_knob[1]}"
+
     def _build_descriptor_and_artifacts(
         self,
         *,
@@ -504,10 +633,7 @@ class BoaController:
             budget_used="scout",
             diff_path=diff_path,
         )
-        knob_summary = ""
-        if descriptor.numeric_knobs:
-            first_knob = next(iter(descriptor.numeric_knobs.items()))
-            knob_summary = f" | knob={first_knob[0]}={first_knob[1]}"
+        knob_summary = self._format_numeric_knob_summary(candidate=candidate, descriptor=descriptor)
         self._emit(
             kind="descriptor_ready",
             message=(
@@ -558,12 +684,13 @@ class BoaController:
         trial_id: str,
         trial_branch: str,
         artifact_dir: Path,
-    ) -> tuple[str, str | None, float | None, float | None]:
+    ) -> EvaluationSummary:
         canonical_stage: str | None = None
         canonical_score: float | None = None
         canonical_primary_metric: float | None = None
         final_accept = False
         highest_stage = self.acceptance.highest_enabled_stage()
+        stage_results: list[StageRunResult] = []
         for stage_name in enabled_stages(self.config):
             self._emit(
                 kind="stage_started",
@@ -602,6 +729,7 @@ class BoaController:
                     artifact_dir=execution.artifact_dir,
                 )
                 self.store.record_stage_result(trial_id=trial_id, result=stage_result)
+                stage_results.append(stage_result)
                 self._emit(
                     kind="stage_failed",
                     message=f"Stage '{stage_name}' finished with status {execution.status}",
@@ -611,10 +739,28 @@ class BoaController:
                     metadata={"status": execution.status},
                 )
                 if execution.status == "timeout":
-                    return "timed_out", canonical_stage, canonical_score, canonical_primary_metric
+                    return EvaluationSummary(
+                        acceptance_status="timed_out",
+                        canonical_stage=canonical_stage,
+                        canonical_score=canonical_score,
+                        canonical_primary_metric=canonical_primary_metric,
+                        stage_results=stage_results,
+                    )
                 if execution.status == "metric_missing":
-                    return "metric_missing", canonical_stage, canonical_score, canonical_primary_metric
-                return "stage_failed", canonical_stage, canonical_score, canonical_primary_metric
+                    return EvaluationSummary(
+                        acceptance_status="metric_missing",
+                        canonical_stage=canonical_stage,
+                        canonical_score=canonical_score,
+                        canonical_primary_metric=canonical_primary_metric,
+                        stage_results=stage_results,
+                    )
+                return EvaluationSummary(
+                    acceptance_status="stage_failed",
+                    canonical_stage=canonical_stage,
+                    canonical_score=canonical_score,
+                    canonical_primary_metric=canonical_primary_metric,
+                    stage_results=stage_results,
+                )
             incumbent = self.store.get_incumbent(stage_name)
             evaluation = self.acceptance.evaluate_stage(
                 stage_name=stage_name,
@@ -641,6 +787,7 @@ class BoaController:
                 artifact_dir=execution.artifact_dir,
             )
             self.store.record_stage_result(trial_id=trial_id, result=stage_result)
+            stage_results.append(stage_result)
             canonical_stage = stage_name
             canonical_score = evaluation.adjusted_score
             canonical_primary_metric = evaluation.primary_metric
@@ -673,8 +820,20 @@ class BoaController:
             if not evaluation.advanced:
                 break
         if final_accept and canonical_stage == highest_stage and canonical_score is not None:
-            return "completed_accepted", canonical_stage, canonical_score, canonical_primary_metric
-        return "completed_rejected", canonical_stage, canonical_score, canonical_primary_metric
+            return EvaluationSummary(
+                acceptance_status="completed_accepted",
+                canonical_stage=canonical_stage,
+                canonical_score=canonical_score,
+                canonical_primary_metric=canonical_primary_metric,
+                stage_results=stage_results,
+            )
+        return EvaluationSummary(
+            acceptance_status="completed_rejected",
+            canonical_stage=canonical_stage,
+            canonical_score=canonical_score,
+            canonical_primary_metric=canonical_primary_metric,
+            stage_results=stage_results,
+        )
 
     @staticmethod
     def _classify_failure(exc: Exception) -> str:
@@ -842,6 +1001,7 @@ class BoaController:
                     candidate_plan.informed_by_call_ids,
                     load_search_trace(self._search_trace_path(trial_id)),
                 )
+                self._validate_addressed_lesson_ids(candidate_plan.addressed_lesson_ids, planning_context.lesson_memory)
                 parent_branch, parent_trial_id = self._validate_parent(candidate_plan=candidate_plan, oracle=oracle)
                 self.worktree.prepare_trial(trial_branch=trial_branch, parent_branch=parent_branch)
                 self._emit(
@@ -855,31 +1015,54 @@ class BoaController:
                         "branch_name": trial_branch,
                     },
                 )
-                execution_context = self._build_execution_context(
-                    trial_id=trial_id,
-                    trial_branch=trial_branch,
-                    parent_branch=parent_branch,
-                    parent_trial_id=parent_trial_id,
-                    recent_trials=recent_trials,
-                    candidate_plan=candidate_plan,
-                )
-                candidate = self.agent.prepare_candidate(execution_context)
-                self._emit(
-                    kind="execution_completed",
-                    message="Candidate metadata captured. Validating patch and running stages.",
-                    trial_id=trial_id,
-                    phase="execution",
-                )
-                self._validate_informed_by_call_ids(
-                    candidate.informed_by_call_ids,
-                    load_search_trace(self._search_trace_path(trial_id)),
-                )
-                artifact_dir, diff_path, descriptor = self._build_descriptor_and_artifacts(
-                    trial_id=trial_id,
-                    parent_branch=parent_branch,
-                    parent_trial_id=parent_trial_id,
-                    candidate=candidate,
-                )
+                artifact_dir = None
+                for attempt_index in (1, 2):
+                    execution_context = self._build_execution_context(
+                        trial_id=trial_id,
+                        trial_branch=trial_branch,
+                        parent_branch=parent_branch,
+                        parent_trial_id=parent_trial_id,
+                        recent_trials=recent_trials,
+                        candidate_plan=candidate_plan,
+                        attempt_index=attempt_index,
+                        execution_feedback=None if attempt_index == 1 else self._no_patch_feedback(),
+                    )
+                    if attempt_index > 1:
+                        self._emit(
+                            kind="execution_retry",
+                            message="Previous execution attempt produced no surviving tracked edits. Requesting one retry with explicit diff requirements.",
+                            trial_id=trial_id,
+                            phase="execution",
+                            metadata={"attempt": attempt_index},
+                        )
+                    candidate = self.agent.prepare_candidate(execution_context)
+                    self._emit(
+                        kind="execution_completed",
+                        message="Candidate metadata captured. Validating patch and running stages.",
+                        trial_id=trial_id,
+                        phase="execution",
+                        metadata={"attempt": attempt_index},
+                    )
+                    self._validate_informed_by_call_ids(
+                        candidate.informed_by_call_ids,
+                        load_search_trace(self._search_trace_path(trial_id)),
+                    )
+                    self._validate_candidate_lesson_subset(
+                        candidate.addressed_lesson_ids,
+                        candidate_plan.addressed_lesson_ids,
+                    )
+                    try:
+                        artifact_dir, diff_path, descriptor = self._build_descriptor_and_artifacts(
+                            trial_id=trial_id,
+                            parent_branch=parent_branch,
+                            parent_trial_id=parent_trial_id,
+                            candidate=candidate,
+                        )
+                        break
+                    except WorktreeError as exc:
+                        if "did not modify any tracked files" not in str(exc).lower() or attempt_index >= 2:
+                            raise
+                assert artifact_dir is not None
                 self.store.create_trial(
                     run_tag=self.config.run.tag,
                     trial_id=trial_id,
@@ -896,12 +1079,12 @@ class BoaController:
                 self.worktree.commit_trial(self._commit_message(trial_id, candidate))
                 if self.runner.requires_remote_branches:
                     self.worktree.push_branch(remote=self.config.runner.ssh.git_remote, branch=trial_branch, force=True)
-                acceptance_status, canonical_stage, canonical_score, canonical_primary_metric = self._evaluate_candidate(
+                evaluation = self._evaluate_candidate(
                     trial_id=trial_id,
                     trial_branch=trial_branch,
                     artifact_dir=artifact_dir,
                 )
-                if acceptance_status == "completed_accepted":
+                if evaluation.acceptance_status == "completed_accepted":
                     self.worktree.promote_trial(trial_branch=trial_branch)
                     if self.runner.requires_remote_branches:
                         self.worktree.push_branch(
@@ -911,27 +1094,58 @@ class BoaController:
                         )
                 self.store.set_acceptance(
                     trial_id=trial_id,
-                    acceptance_status=acceptance_status,
-                    canonical_stage=canonical_stage,
-                    canonical_score=canonical_score,
+                    acceptance_status=evaluation.acceptance_status,
+                    canonical_stage=evaluation.canonical_stage,
+                    canonical_score=evaluation.canonical_score,
                 )
-                last_acceptance_status = acceptance_status
-                last_canonical_stage = canonical_stage
-                last_canonical_score = canonical_score
+                reflection_context = self._build_reflection_context(
+                    trial_id=trial_id,
+                    candidate_plan=candidate_plan,
+                    candidate=candidate,
+                    evaluation=evaluation,
+                )
+                if reflection_context is not None:
+                    self._emit(
+                        kind="reflection_started",
+                        message=f"Preparing reflection for stage '{reflection_context.source_stage}'",
+                        trial_id=trial_id,
+                        phase="reflection",
+                    )
+                    try:
+                        reflection = self.agent.reflect_trial(reflection_context)
+                    except Exception as exc:
+                        self._emit(
+                            kind="reflection_failed",
+                            message=f"Reflection failed: {self._summarize_exception_detail(exc) or str(exc)}",
+                            trial_id=trial_id,
+                            phase="reflection",
+                        )
+                    else:
+                        self.store.update_trial_reflection(trial_id=trial_id, reflection=reflection)
+                        self._write_reflection_artifact(trial_id=trial_id, reflection=reflection)
+                        self._emit(
+                            kind="reflection_completed",
+                            message=f"Reflection recorded for stage '{reflection.source_stage}'",
+                            trial_id=trial_id,
+                            phase="reflection",
+                        )
+                last_acceptance_status = evaluation.acceptance_status
+                last_canonical_stage = evaluation.canonical_stage
+                last_canonical_score = evaluation.canonical_score
                 last_detail = None
                 consecutive_failures = 0
                 self._emit(
                     kind="trial_completed",
-                    message=f"Trial {trial_id} finished with status {acceptance_status}",
+                    message=f"Trial {trial_id} finished with status {evaluation.acceptance_status}",
                     trial_id=trial_id,
                     metadata={
-                        "acceptance_status": acceptance_status,
+                        "acceptance_status": evaluation.acceptance_status,
                         "branch_name": trial_branch,
                         "parent_branch": parent_branch,
                         "parent_trial_id": parent_trial_id,
-                        "canonical_stage": canonical_stage,
-                        "canonical_score": canonical_score,
-                        "primary_metric": canonical_primary_metric,
+                        "canonical_stage": evaluation.canonical_stage,
+                        "canonical_score": evaluation.canonical_score,
+                        "primary_metric": evaluation.canonical_primary_metric,
                     },
                 )
             except PolicyRejectedError as exc:

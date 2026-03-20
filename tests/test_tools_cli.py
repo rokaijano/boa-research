@@ -79,6 +79,7 @@ class ToolsCliTests(unittest.TestCase):
                 operation_type="replace",
                 estimated_risk=0.2,
                 informed_by_call_ids=["boa-call-seed"],
+                addressed_lesson_ids=[],
             ),
             candidate=CandidateMetadata(
                 hypothesis="h",
@@ -87,6 +88,7 @@ class ToolsCliTests(unittest.TestCase):
                 operation_type="replace",
                 estimated_risk=0.2,
                 informed_by_call_ids=["boa-call-seed"],
+                addressed_lesson_ids=[],
             ),
             descriptor=None,
             search_trace=[],

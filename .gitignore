@@ -13,3 +13,7 @@ dist/
 tmp*/*
 examples/**/boa.config
 examples/**/boa.md
+
+_agent_check
+_work_tmp
+_*tmp*

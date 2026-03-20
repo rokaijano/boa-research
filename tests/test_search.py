@@ -13,12 +13,22 @@ from boaresearch.schema import (
     RunnerConfig,
     RunnerStageConfig,
     SearchConfig,
+    TrialReflection,
     TrialSummary,
 )
 from boaresearch.search import SearchOracleService, SearchToolbox, SearchTraceRecorder
 
 
-def build_trial(trial_id: str, score: float, category: str, *, knobs: dict[str, float] | None = None) -> TrialSummary:
+def build_trial(
+    trial_id: str,
+    score: float,
+    category: str,
+    *,
+    knobs: dict[str, float] | None = None,
+    addressed_lesson_ids: list[str] | None = None,
+    reflection: TrialReflection | None = None,
+    created_at: str | None = None,
+) -> TrialSummary:
     candidate = CandidateMetadata(
         hypothesis="h",
         rationale_summary=f"{category} update",
@@ -26,6 +36,7 @@ def build_trial(trial_id: str, score: float, category: str, *, knobs: dict[str, 
         operation_type="replace",
         estimated_risk=0.2,
         informed_by_call_ids=["boa-call-seed"],
+        addressed_lesson_ids=list(addressed_lesson_ids or []),
     )
     descriptor = PatchDescriptor(
         touched_files=["src/train.py"],
@@ -52,6 +63,8 @@ def build_trial(trial_id: str, score: float, category: str, *, knobs: dict[str, 
         candidate_plan=None,
         candidate=candidate,
         descriptor=descriptor,
+        reflection=reflection,
+        created_at=created_at or f"2024-01-01T00:00:0{trial_id[-1]}+00:00",
     )
 
 
@@ -140,6 +153,74 @@ class SearchTests(unittest.TestCase):
         regions = oracle.propose_numeric_knob_regions({"patch_category": "optimizer"})
         self.assertEqual(regions[0]["name"], "learning_rate")
         self.assertGreater(regions[0]["count"], 1)
+
+    def test_planning_trial_dataset_includes_metric_and_patch_fields(self) -> None:
+        oracle = SearchOracleService(
+            config=build_config(),
+            memory=[build_trial("t1", 0.5, "optimizer", knobs={"learning_rate": 0.001})],
+            accepted_branch="boa/demo/accepted",
+        )
+        dataset = oracle.planning_trial_dataset()
+        self.assertEqual(dataset[0]["trial_id"], "t1")
+        self.assertEqual(dataset[0]["canonical_score"], 0.5)
+        self.assertEqual(dataset[0]["patch_category"], "optimizer")
+        self.assertIn("learning_rate", dataset[0]["numeric_knobs"])
+
+    def test_planning_suggestion_report_is_advisory(self) -> None:
+        oracle = SearchOracleService(
+            config=build_config(),
+            memory=[build_trial("t1", 0.5, "optimizer", knobs={"learning_rate": 0.001})],
+            accepted_branch="boa/demo/accepted",
+        )
+        report = oracle.planning_suggestion_report()
+        self.assertEqual(report["report_type"], "planning_bo_suggestions")
+        self.assertIn("advisory", report["note"])
+        self.assertIn("parent_suggestions", report)
+        self.assertIn("patch_family_ranking", report)
+        self.assertIn("numeric_knob_regions", report)
+
+    def test_planning_lesson_memory_aggregates_later_trial_outcomes(self) -> None:
+        lesson_source = build_trial(
+            "t1",
+            0.4,
+            "optimizer",
+            reflection=TrialReflection(
+                source_stage="scout",
+                source_commands=["python train.py"],
+                behavior_summary="Validation stalled despite lower training loss.",
+                primary_problem="Generalization plateaued.",
+                under_optimized=["regularization"],
+                suggested_fixes=["Increase weight decay slightly."],
+                evidence=["train loss fell while validation stalled"],
+                outcome="Initial patch was insufficient.",
+            ),
+            created_at="2024-01-01T00:00:01+00:00",
+        )
+        failed_followup = build_trial(
+            "t2",
+            0.3,
+            "optimizer",
+            addressed_lesson_ids=["t1:lesson:1"],
+            created_at="2024-01-01T00:00:02+00:00",
+        )
+        failed_followup.acceptance_status = "completed_rejected"
+        accepted_followup = build_trial(
+            "t3",
+            0.8,
+            "optimizer",
+            addressed_lesson_ids=["t1:lesson:1"],
+            created_at="2024-01-01T00:00:03+00:00",
+        )
+        accepted_followup.acceptance_status = "completed_accepted"
+        oracle = SearchOracleService(
+            config=build_config(),
+            memory=[lesson_source, failed_followup, accepted_followup],
+            accepted_branch="boa/demo/accepted",
+        )
+        lessons = oracle.planning_lesson_memory(limit=8)
+        self.assertEqual(lessons[0]["lesson_id"], "t1:lesson:1")
+        self.assertEqual(lessons[0]["status"], "mixed")
+        self.assertEqual(lessons[0]["last_trial_id"], "t3")
 
     def test_toolbox_emits_call_ids(self) -> None:
         trace_path = Path.cwd() / "_tmp_search_calls.jsonl"

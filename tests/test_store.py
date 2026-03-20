@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from boaresearch.schema import CandidateMetadata, CandidatePlan, PatchDescriptor, SearchToolCall, StageCommandResult, StageRunResult
+from boaresearch.schema import CandidateMetadata, CandidatePlan, PatchDescriptor, SearchToolCall, StageCommandResult, StageRunResult, TrialReflection
 from boaresearch.runtime import ExperimentStore
 
 
@@ -20,6 +20,7 @@ class StoreTests(unittest.TestCase):
             operation_type="replace",
             estimated_risk=0.2,
             informed_by_call_ids=["boa-call-1"],
+            addressed_lesson_ids=["demo-0000:lesson:1"],
         )
         candidate_plan = CandidatePlan(
             hypothesis="h",
@@ -29,6 +30,7 @@ class StoreTests(unittest.TestCase):
             operation_type="replace",
             estimated_risk=0.2,
             informed_by_call_ids=["boa-call-1"],
+            addressed_lesson_ids=["demo-0000:lesson:1"],
         )
         descriptor = PatchDescriptor(
             touched_files=["src/train.py"],
@@ -108,6 +110,19 @@ class StoreTests(unittest.TestCase):
             canonical_stage="scout",
             canonical_score=0.9,
         )
+        store.update_trial_reflection(
+            trial_id="demo-0001",
+            reflection=TrialReflection(
+                source_stage="scout",
+                source_commands=["python train.py"],
+                behavior_summary="Validation plateaued after a quick gain.",
+                primary_problem="Generalization stalled.",
+                under_optimized=["regularization"],
+                suggested_fixes=["Increase weight decay slightly."],
+                evidence=["train loss fell while validation stalled"],
+                outcome="Attempted fix was not enough yet.",
+            ),
+        )
         recent = store.recent_trials(limit=5)
         incumbent = store.get_incumbent("scout")
         self.assertEqual(len(recent), 1)
@@ -115,6 +130,9 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(recent[0].canonical_stage, "scout")
         self.assertIsNotNone(recent[0].candidate_plan)
         self.assertEqual(recent[0].candidate_plan.selected_parent_branch, "boa/demo/accepted")
+        self.assertEqual(recent[0].candidate.addressed_lesson_ids, ["demo-0000:lesson:1"])
+        self.assertIsNotNone(recent[0].reflection)
+        self.assertEqual(recent[0].reflection.source_stage, "scout")
         self.assertEqual(recent[0].search_trace[0].call_id, "boa-call-1")
         self.assertIsNotNone(incumbent)
         self.assertEqual(incumbent.trial_id, "demo-0001")
